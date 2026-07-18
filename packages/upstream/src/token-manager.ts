@@ -108,12 +108,14 @@ export class TokenManager {
 
   applyTokenResponse(response: TokenResponse): void {
     if (!this.creds) throw new UpstreamError('no credentials loaded', 'UPSTREAM_AUTH_REQUIRED');
+    // The upstream's expires_in overstates real token life (observed: tokens
+    // die in ~5 minutes regardless). Cap our assumption so proactive refresh
+    // stays honest; a stale token still recovers via the 401 retry path.
+    const expiresInSec = Math.min(response.expires_in ?? 300, 300);
     this.creds = {
       ...this.creds,
       access_token: response.access_token,
-      access_token_expires_at: new Date(
-        this.nowMs() + (response.expires_in ?? 300) * 1000,
-      ).toISOString(),
+      access_token_expires_at: new Date(this.nowMs() + expiresInSec * 1000).toISOString(),
       // rotating refresh tokens: keep the new one when the server sends it
       refresh_token: response.refresh_token ?? this.creds.refresh_token,
     };
@@ -149,6 +151,8 @@ export class TokenManager {
 
 export function isAuthFailure(err: unknown): boolean {
   if (err instanceof UpstreamError) return err.code === 'UPSTREAM_AUTH_REQUIRED';
+  // The MCP SDK's StreamableHTTPError carries the HTTP status in `code`.
+  if (err instanceof Error && (err as { code?: unknown }).code === 401) return true;
   const message = err instanceof Error ? err.message : String(err);
-  return /\b401\b|unauthorized/i.test(message);
+  return /\b401\b|unauthorized|invalid or expired token/i.test(message);
 }

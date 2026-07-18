@@ -60,6 +60,10 @@ export class RealUpstream implements UpstreamClient {
       }
       throw new UpstreamError(`upstream ${name} failed: ${text}`);
     }
+    // agent-cards returns machine-readable structuredContent alongside a
+    // human-readable text block (verified against production 2026-07-17).
+    const structured = (result as { structuredContent?: unknown }).structuredContent;
+    if (structured !== undefined) return structured;
     const text = contentText(result.content);
     try {
       return JSON.parse(text);
@@ -85,7 +89,21 @@ export class RealUpstream implements UpstreamClient {
 
   async createCard(req: { amount_cents: number; sandbox: boolean }): Promise<{ card_id: string }> {
     const result = asRecord(await this.call('create_card', req), 'create_card');
-    const cardId = result['card_id'] ?? result['id'];
+    // Business-level statuses come back as successful results with a status
+    // field (kyc_required, wallet_funding_required, user_info_required,
+    // deposit_confirming, …). Surface them as clean upstream errors.
+    const status = result['status'];
+    if (typeof status === 'string' && !['ok', 'created', 'success', 'active'].includes(status)) {
+      const message = typeof result['message'] === 'string' ? result['message'] : status;
+      throw new UpstreamError(`create_card blocked upstream (${status}): ${message.split('\n')[0]}`);
+    }
+    const card = result['card'];
+    const cardId =
+      result['card_id'] ??
+      result['id'] ??
+      (card && typeof card === 'object'
+        ? ((card as Record<string, unknown>)['card_id'] ?? (card as Record<string, unknown>)['id'])
+        : undefined);
     if (typeof cardId !== 'string') {
       throw new UpstreamError('create_card response missing card_id');
     }

@@ -1,1 +1,1 @@
-export const PACKAGE = '@warden/cli';
+export { formatAuthStatus, runAuthFlow } from './auth.js';

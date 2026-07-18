@@ -17,5 +17,8 @@
   "dependencies": {
     "@warden/upstream": "workspace:*",
     "open": "^10.1.0"
+  },
+  "bin": {
+    "warden": "./dist/cli.js"
   }
 }

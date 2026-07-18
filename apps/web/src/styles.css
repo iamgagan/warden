@@ -1,5 +1,171 @@
 :root {
   font-family: -apple-system, 'Helvetica Neue', Helvetica, Arial, sans-serif;
   color: #1a1a1a;
+  background: #f5f5f4;
 }
-body { margin: 0; padding: 24px; }
+
+* { box-sizing: border-box; }
+body { margin: 0; }
+h1, h2, h3 { margin: 0; }
+
+.mono { font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 0.85em; }
+.subtle { color: #777; font-size: 13px; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.error { color: #b91c1c; padding: 0 24px; }
+
+/* token gate */
+.gate {
+  max-width: 420px;
+  margin: 18vh auto;
+  padding: 32px;
+  background: #fff;
+  border: 1px solid #e5e5e5;
+  border-radius: 10px;
+}
+.gate h1 { font-size: 28px; margin-bottom: 8px; }
+.gate p { color: #555; }
+.gate form { display: flex; gap: 8px; margin-top: 16px; }
+.gate input {
+  flex: 1;
+  padding: 10px 12px;
+  border: 1px solid #d4d4d4;
+  border-radius: 6px;
+  font-size: 14px;
+}
+.gate button {
+  padding: 10px 16px;
+  border: none;
+  border-radius: 6px;
+  background: #1a1a1a;
+  color: #fff;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+/* layout */
+.layout { max-width: 1100px; margin: 0 auto; padding: 24px; }
+
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 20px;
+}
+.brand { display: flex; align-items: baseline; gap: 12px; }
+.brand h1 { font-size: 26px; letter-spacing: -0.5px; }
+.tagline { color: #888; font-size: 13px; }
+.badges { display: flex; gap: 8px; }
+.badge {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  padding: 4px 10px;
+  border-radius: 99px;
+}
+.badge.mode-test { background: #e0ecff; color: #1d4ed8; }
+.badge.mode-live { background: #dcfce7; color: #15803d; }
+.badge.warn { background: #fef3c7; color: #92400e; text-transform: none; letter-spacing: 0; }
+
+/* stats */
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.stat {
+  background: #fff;
+  border: 1px solid #e5e5e5;
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+.stat-value { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.stat-label {
+  color: #888;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  margin-top: 2px;
+}
+
+/* receipts panel */
+.panel {
+  background: #fff;
+  border: 1px solid #e5e5e5;
+  border-radius: 10px;
+  padding: 18px 20px;
+}
+.panel h2 { font-size: 15px; margin-bottom: 10px; }
+.empty { color: #777; padding: 24px 0; }
+
+table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+th {
+  text-align: left;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: #999;
+  border-bottom: 2px solid #1a1a1a;
+  padding: 6px 10px 6px 0;
+}
+th.num { text-align: right; }
+td { border-bottom: 1px solid #eee; padding: 9px 10px 9px 0; vertical-align: top; }
+tbody tr { cursor: pointer; }
+tbody tr:hover { background: #fafaf9; }
+.intent { max-width: 320px; }
+
+/* drawer */
+.drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.25);
+}
+.drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(480px, 92vw);
+  background: #fff;
+  border-left: 1px solid #e5e5e5;
+  box-shadow: -12px 0 32px rgba(0, 0, 0, 0.12);
+  padding: 24px;
+  overflow-y: auto;
+}
+.drawer h2 { font-size: 20px; margin-bottom: 4px; }
+.drawer h3 {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: #999;
+  margin: 20px 0 6px;
+}
+.drawer .close {
+  position: absolute;
+  top: 14px;
+  right: 16px;
+  border: none;
+  background: none;
+  font-size: 22px;
+  color: #999;
+  cursor: pointer;
+}
+.intent-full {
+  margin: 0;
+  padding: 12px 14px;
+  background: #f5f5f4;
+  border-left: 3px solid #1a1a1a;
+  border-radius: 4px;
+  font-size: 15px;
+}
+.drawer pre {
+  background: #f5f5f4;
+  border-radius: 6px;
+  padding: 12px;
+  font-size: 12px;
+  overflow-x: auto;
+}

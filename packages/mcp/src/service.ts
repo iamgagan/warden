@@ -204,9 +204,14 @@ export class WardenService {
     total_spent_cents: number;
   }> {
     const task = this.activeTaskOrThrow(input.task_id);
+    // Catch up on settlements first: a card whose purchase already settled
+    // upstream must become 'used' (keeping its spend) before we close the
+    // remainder and release their reservations.
+    await this.reconcileNow();
     const cards = this.repo.listCardsByTask(task.id);
     for (const card of cards) {
-      if (card.state !== 'open') continue;
+      const current = this.repo.getCard(card.id);
+      if (current?.state !== 'open') continue;
       try {
         await this.upstream.closeCard(card.id);
       } catch (err) {

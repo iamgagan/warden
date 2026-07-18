@@ -260,6 +260,10 @@ export function createRepo(db: WardenDrizzle) {
       return result.changes > 0;
     },
 
+    updateTransactionStatus(id: string, status: TransactionRow['status']): void {
+      db.update(transactions).set({ status }).where(eq(transactions.id, id)).run();
+    },
+
     getTransaction(id: string): TransactionRow | undefined {
       return db.select().from(transactions).where(eq(transactions.id, id)).get();
     },

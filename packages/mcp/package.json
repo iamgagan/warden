@@ -23,5 +23,8 @@
   },
   "devDependencies": {
     "@warden/mock-agentcard": "workspace:*"
+  },
+  "bin": {
+    "warden-mcp": "./dist/main.js"
   }
 }

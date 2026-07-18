@@ -407,6 +407,28 @@ export function createRepo(db: WardenDrizzle) {
         .all();
     },
 
+    stats(): {
+      spendUnderManagementCents: number;
+      receiptsTotal: number;
+      blocksTotal: number;
+      avgBlastRadiusCents: number;
+    } {
+      const spent = db.select({ n: sql<number>`coalesce(sum(${tasks.spentCents}), 0)` }).from(tasks).get();
+      // mean open-card exposure per task that currently has open cards
+      const blast = db.get<{ n: number }>(sql`
+        SELECT coalesce(avg(exposure), 0) AS n FROM (
+          SELECT sum(amount_cents) AS exposure FROM cards
+          WHERE state = 'open' GROUP BY task_id
+        )
+      `);
+      return {
+        spendUnderManagementCents: spent?.n ?? 0,
+        receiptsTotal: this.countReceipts(),
+        blocksTotal: this.countPolicyEvents('block'),
+        avgBlastRadiusCents: Math.round(blast?.n ?? 0),
+      };
+    },
+
     // ── rollups (dashboard/stats) ─────────────────────────────────────────
     agentRollups(): AgentRollup[] {
       const rows = db.all<{

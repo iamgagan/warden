@@ -19,12 +19,11 @@
     "@warden/core": "workspace:*",
     "@warden/db": "workspace:*",
     "@warden/upstream": "workspace:*",
-    "zod": "^3.23.8"
-  },
-  "devDependencies": {
+    "zod": "^3.23.8",
     "@warden/mock-agentcard": "workspace:*"
   },
   "bin": {
-    "warden-mcp": "./dist/main.js"
+    "warden-mcp": "./dist/main.js",
+    "warden-demo-agent": "./dist/demo-agent.js"
   }
 }

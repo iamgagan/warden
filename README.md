@@ -50,10 +50,20 @@ Sandbox by default: `WARDEN_MODE=test` (the default) passes `sandbox: true` on e
 
 ### Offline demo (no credentials needed)
 
+The demo agent drives warden-mcp over stdio exactly like a real agent's MCP client
+(same transport, same tools, same errors) against the in-process mock rail:
+
 ```bash
-node scripts/seed-demo.mjs ./warden-demo.db
+# terminal 1 — dashboard
+node packages/mcp/dist/demo-agent.js ./warden-demo.db --fresh   # creates the db, exits
 WARDEN_API_TOKEN=demo-token WARDEN_DB_PATH=./warden-demo.db node packages/api/dist/main.js
+
+# terminal 2 — narrated agent run: task → card → purchase → receipt → injected
+# purchase blocked (POLICY_BLOCKED, no card ever minted) → task complete
+node packages/mcp/dist/demo-agent.js ./warden-demo.db --fresh
 ```
+
+`scripts/seed-demo.mjs` seeds a richer multi-agent dataset for dashboard browsing.
 
 ### Point an agent at Warden
 

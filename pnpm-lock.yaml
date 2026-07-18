@@ -116,16 +116,15 @@ importers:
       '@warden/db':
         specifier: workspace:*
         version: link:../db
+      '@warden/mock-agentcard':
+        specifier: workspace:*
+        version: link:../mock-agentcard
       '@warden/upstream':
         specifier: workspace:*
         version: link:../upstream
       zod:
         specifier: ^3.23.8
         version: 3.25.76
-    devDependencies:
-      '@warden/mock-agentcard':
-        specifier: workspace:*
-        version: link:../mock-agentcard
 
   packages/mock-agentcard:
     dependencies:

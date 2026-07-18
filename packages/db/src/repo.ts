@@ -218,6 +218,28 @@ export function createRepo(db: WardenDrizzle) {
       return db.select().from(cards).where(eq(cards.state, state)).all();
     },
 
+    /** Cards issued for an agent since the ISO timestamp (issuance velocity). */
+    countCardsIssuedSince(agentId: string, sinceIso: string): number {
+      const row = db
+        .select({ n: sql<number>`count(*)` })
+        .from(cards)
+        .innerJoin(tasks, eq(cards.taskId, tasks.id))
+        .where(and(eq(tasks.agentId, agentId), sql`${cards.createdAt} >= ${sinceIso}`))
+        .get();
+      return row?.n ?? 0;
+    },
+
+    /** Sum of card amounts issued for an agent since the ISO timestamp (daily amount). */
+    sumCardAmountsSince(agentId: string, sinceIso: string): number {
+      const row = db
+        .select({ n: sql<number>`coalesce(sum(${cards.amountCents}), 0)` })
+        .from(cards)
+        .innerJoin(tasks, eq(cards.taskId, tasks.id))
+        .where(and(eq(tasks.agentId, agentId), sql`${cards.createdAt} >= ${sinceIso}`))
+        .get();
+      return row?.n ?? 0;
+    },
+
     /** Open cards created before the given ISO timestamp (for TTL sweep). */
     listOpenCardsCreatedBefore(isoTimestamp: string): CardRow[] {
       return db

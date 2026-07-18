@@ -1,1 +1,1 @@
-export const PACKAGE = '@warden/upstream';
+export * from './types.js';

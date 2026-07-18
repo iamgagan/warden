@@ -1,1 +1,1 @@
-export const PACKAGE = '@warden/mock-agentcard';
+export { MockClock, MockUpstream } from './mock.js';

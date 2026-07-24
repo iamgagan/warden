@@ -103,6 +103,12 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       CREATE INDEX approvals_status ON approvals (status);
     `,
   },
+  {
+    id: '0002_cards_rail',
+    sql: `
+      ALTER TABLE cards ADD COLUMN rail TEXT NOT NULL DEFAULT 'agentcard';
+    `,
+  },
 ];
 
 export function migrate(sqlite: Database): void {

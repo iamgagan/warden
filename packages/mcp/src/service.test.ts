@@ -2,8 +2,45 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { PolicyRulesSchema } from '@warden/core';
 import { openWardenDb, type WardenDb } from '@warden/db';
 import { MockUpstream } from '@warden/mock-agentcard';
+import type { UpstreamClient } from '@warden/upstream';
 import { WardenToolError } from './errors.js';
 import { WardenService } from './service.js';
+
+/**
+ * A second rail's real card_id namespace never collides with AgentCard's
+ * (e.g. Stripe's "ic_..." vs AgentCard's own ids) — but two bare MockUpstream
+ * instances both count from "mock_card_1", so tests that exercise two rails
+ * side by side need distinct id namespaces to avoid an artificial collision.
+ */
+function fakeRail(prefix: string): UpstreamClient {
+  const inner = new MockUpstream();
+  const toInner = new Map<string, string>();
+  const toOuter = (id: string) => `${prefix}_${id}`;
+  return {
+    async createCard(req) {
+      const { card_id } = await inner.createCard(req);
+      const outer = toOuter(card_id);
+      toInner.set(outer, card_id);
+      return { card_id: outer };
+    },
+    async closeCard(id) {
+      return inner.closeCard(toInner.get(id)!);
+    },
+    async getCardDetails(id) {
+      const d = await inner.getCardDetails(toInner.get(id)!);
+      return { ...d, card_id: id };
+    },
+    async listTransactions(id, opts) {
+      return inner.listTransactions(toInner.get(id)!, opts);
+    },
+    async listCards() {
+      return (await inner.listCards()).map((c) => ({ ...c, card_id: toOuter(c.card_id) }));
+    },
+    async checkBalance(id) {
+      return inner.checkBalance(toInner.get(id)!);
+    },
+  };
+}
 
 let db: WardenDb;
 let upstream: MockUpstream;
@@ -12,7 +49,7 @@ let service: WardenService;
 beforeEach(() => {
   db = openWardenDb(':memory:');
   upstream = new MockUpstream();
-  service = new WardenService({ repo: db.repo, upstream, mode: 'test' });
+  service = new WardenService({ repo: db.repo, upstreams: { agentcard: upstream }, mode: 'test' });
 });
 
 const setPolicy = (agentName: string, rules: object) => {
@@ -55,6 +92,7 @@ describe('warden_issue_card', () => {
       amount_cents: 1500,
       single_use: true,
       expires: '7d-unused',
+      rail: 'agentcard',
     });
     expect((await upstream.listCards())[0]).toMatchObject({ sandbox: true, state: 'open' });
     expect(db.repo.getTask(task_id)?.spentCents).toBe(1500); // reservation
@@ -182,5 +220,54 @@ describe('error payloads', () => {
   it('serializes code + details for the MCP layer', () => {
     const err = new WardenToolError('POLICY_BLOCKED', 'nope', { reasons: ['a', 'b'] });
     expect(err.toPayload()).toEqual({ code: 'POLICY_BLOCKED', message: 'nope', reasons: ['a', 'b'] });
+  });
+});
+
+describe('multi-rail (SPEC §2.8)', () => {
+  it('issues to the requested rail, defaults to agentcard, and dispatches getCardDetails/completeTask per-card by rail', async () => {
+    const stripeRail = fakeRail('stripe');
+    const multiRail = new WardenService({
+      repo: db.repo,
+      upstreams: { agentcard: upstream, stripe: stripeRail },
+      mode: 'test',
+    });
+    const { task_id } = multiRail.startTask({ agent_name: 'shopper', intent: 'multi-rail run' });
+
+    const viaStripe = await multiRail.issueCard({ task_id, amount_cents: 1000, rail: 'stripe' });
+    expect(viaStripe.rail).toBe('stripe');
+    expect(await stripeRail.listCards()).toHaveLength(1);
+    expect(await upstream.listCards()).toHaveLength(0);
+
+    const viaAgentCard = await multiRail.issueCard({ task_id, amount_cents: 500 });
+    expect(viaAgentCard.rail).toBe('agentcard'); // default_rail when `rail` is omitted
+    expect(await upstream.listCards()).toHaveLength(1);
+
+    // getCardDetails must ask the card's own rail, not always the default.
+    const details = await multiRail.getCardDetails({ card_id: viaStripe.card_id });
+    expect(details.card_id).toBe(viaStripe.card_id);
+
+    await multiRail.completeTask({ task_id });
+    expect((await stripeRail.listCards())[0]).toMatchObject({ state: 'closed' });
+    expect((await upstream.listCards())[0]).toMatchObject({ state: 'closed' });
+  });
+
+  it('respects policy.default_rail when `rail` is omitted from warden_issue_card', async () => {
+    setPolicy('stripe-shopper', { default_rail: 'stripe' });
+    const stripeRail = fakeRail('stripe');
+    const multiRail = new WardenService({
+      repo: db.repo,
+      upstreams: { agentcard: upstream, stripe: stripeRail },
+      mode: 'test',
+    });
+    const { task_id } = multiRail.startTask({ agent_name: 'stripe-shopper', intent: 'x' });
+    const card = await multiRail.issueCard({ task_id, amount_cents: 500 });
+    expect(card.rail).toBe('stripe');
+  });
+
+  it('throws UPSTREAM_ERROR when the requested rail has no configured client', async () => {
+    const { task_id } = service.startTask({ agent_name: 'shopper', intent: 'x' });
+    await expect(
+      service.issueCard({ task_id, amount_cents: 1000, rail: 'stripe' }),
+    ).rejects.toThrow(/not configured/);
   });
 });

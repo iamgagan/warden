@@ -6,6 +6,7 @@ export interface Receipt {
   currency: string;
   category: string | null;
   card_id: string;
+  rail: 'agentcard' | 'stripe';
   task_id: string;
   policy_id: string | null;
   agent: string;

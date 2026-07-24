@@ -25,6 +25,7 @@ export const PolicyRulesSchema = z
       .default({}),
     approval_threshold_cents: z.number().int().nonnegative().default(0),
     card_ttl_minutes: z.number().int().positive().default(60),
+    default_rail: z.enum(['agentcard', 'stripe']).default('agentcard'),
   })
   .strict();
 

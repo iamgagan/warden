@@ -1,7 +1,8 @@
 # Warden — Technical Specification (SPEC.md)
 
-**Version:** 1.2 · 2026-07-09
+**Version:** 1.3 · 2026-07-24
 **Status:** Source of truth for implementation. A coding model (Codex) should be able to start at Task T1 and proceed strictly in order without further clarification.
+**Changelog v1.3:** Multi-rail pivot. §2.7 renamed to cover the upstream boundary generally; a second `UpstreamClient` implementation (`packages/upstream-stripe`, Stripe Issuing test mode) is added alongside AgentCard. `cards.rail` column added. This was a deliberate scope change made under time pressure ahead of an investor demo — see §2.4 item 7 and the new §2.8 for the rationale and what changed vs. what stayed true.
 **Changelog v1.2:** Ship Season is a 6-week season ending Aug 16, 2026 (not 12 weeks). Roadmap phases remapped to the 6-week calendar; task order unchanged. T17 (categorization + budgets) downgraded to stretch goal.
 **Changelog v1.1:** Upstream auth rewritten for OAuth 2.0 + PKCE (verified: static bearer headers are rejected; access tokens live ~5 minutes). Card lifecycle changed from card-per-task to card-per-purchase (verified: upstream cards are $1–$50, auto-cancel after one authorized payment, expire after 7 days unused). Sandbox is a per-call flag. Added mock upstream server so implementation and CI never require live credentials.
 **Companion docs (strategy, not needed for coding):** `~/Documents/Startup Ideas/Warden - AgentCard Spend Guardrails - Ship Season Build Spec.md`, `Warden - CEO Review - 2026-07-06.md`
@@ -66,6 +67,7 @@ warden/
     db/                   # drizzle schema, migrations, repository functions
     upstream/             # OAuth token manager + typed agent-cards MCP client
     mock-agentcard/       # in-process MCP server implementing the upstream tool surface
+    upstream-stripe/      # UpstreamClient over Stripe Issuing (test mode), second rail (v1.3)
     mcp/                  # warden-mcp server (proxy) + reconciler loop
     api/                  # warden-api Hono server (serves JSON + static web build)
     cli/                  # `warden` CLI: auth bootstrap, serve, seed
@@ -82,7 +84,7 @@ warden/
 4. **Deterministic policy only.** The enforcement path contains no LLM/ML calls and no network calls other than to the upstream agent-cards MCP. Same inputs always produce the same decision. (Categorization for analytics may be heuristic, but it never gates a payment.)
 5. **Append-only audit.** Receipts and policy events are never updated or deleted, matching Visa Rules §4.1.24 record-retention framing (consent/instruction records producible on request). Corrections are new rows.
 6. **Money as integer cents, time as UTC ISO 8601.** Everywhere, no exceptions.
-7. **Upstream is swappable.** `packages/upstream` exposes an `UpstreamClient` interface; the real client and `mock-agentcard` both implement it. Everything else depends only on the interface.
+7. **Upstream is swappable.** `packages/upstream` exposes an `UpstreamClient` interface; `RealUpstream` (AgentCard), `MockUpstream` (`mock-agentcard`), and `StripeUpstream` (`upstream-stripe`, v1.3) all implement it. Everything else — policy engine, reconciler, receipts, API, dashboard — depends only on the interface, never on which rail is behind it.
 
 ### 2.5 Data model (drizzle/SQLite)
 
@@ -99,9 +101,11 @@ tasks         id TEXT PK · agent_id TEXT FK · intent TEXT NOT NULL
               created_at TEXT · closed_at TEXT NULL
               -- a task has 0..N cards (cards.task_id); no card_id column here
 
-cards         id TEXT PK (AgentCard card_id, verbatim) · task_id TEXT FK
+cards         id TEXT PK (upstream card_id, verbatim) · task_id TEXT FK
               amount_cents INTEGER · merchant_hint TEXT NULL · sandbox INTEGER (0/1)
               state TEXT ('open'|'used'|'closed'|'expired') · created_at TEXT · closed_at TEXT NULL
+              rail TEXT ('agentcard'|'stripe') NOT NULL DEFAULT 'agentcard'  -- v1.3: which
+              -- UpstreamClient issued this card; the reconciler dispatches per-card by rail
 
 transactions  id TEXT PK (AgentCard txn id, verbatim) · card_id TEXT FK
               merchant TEXT · amount_cents INTEGER · currency TEXT · category TEXT NULL
@@ -138,6 +142,8 @@ type PolicyRules = {
   approval_threshold_cents: number;   // >0: card requests above require human approval
   card_ttl_minutes: number;           // Warden-side early close of unused cards (default 60;
                                       // upstream expires unused cards at 7 days regardless)
+  default_rail: 'agentcard' | 'stripe';  // v1.3: which UpstreamClient issues cards for this
+                                          // policy when warden_issue_card omits `rail`
 };
 ```
 
@@ -149,6 +155,20 @@ type PolicyRules = {
 - Do **not** copy tokens from `~/.claude.json` or `~/.agent-cards/config.json` — the AgentCard CLI's WorkOS tokens are NOT accepted by the MCP endpoint (verified 401).
 - Interactive login happens exactly once, human-driven, via `warden auth` (opens browser, completes PKCE flow, persists tokens). All other code paths must work headlessly with the stored refresh token.
 - Known upstream tool constraints (from agentcard.sh/mcp docs): `create_card(amount_cents: 100–5000, sandbox?: boolean)`; cards auto-cancel after one authorized payment; unused cards expire after 7 days; `get_card_details` may require human approval upstream before returning PAN/CVV; `list_transactions(card_id, limit?, status?)`.
+
+### 2.8 Second rail: Stripe Issuing (added v1.3)
+
+`packages/upstream-stripe` implements the same `UpstreamClient` interface (§3.2) against Stripe's Issuing API in test mode, proving the swappable-upstream boundary with a second real rail rather than a second mock. Selected per-card via `rail: 'agentcard' | 'stripe'` on `warden_issue_card` (defaults to the policy's `default_rail`, itself defaulting to `'agentcard'`).
+
+- Endpoint: standard Stripe API (`api.stripe.com`), `STRIPE_SECRET_KEY` (test-mode `sk_test_...`) via env, never committed, never logged.
+- Cardholder: one Warden-owned `issuing.cardholders` record created once and cached; all cards are issued under it.
+- `createCard`: `issuing.cards.create({ cardholder, type: 'virtual', currency: 'usd', spending_controls: { spending_limits: [{ amount: amount_cents, interval: 'all_time' }] } })`. The `all_time` spending limit is the network-enforced hard cap — Stripe declines any authorization that would exceed it, same guarantee as AgentCard's loaded-balance model.
+- **Honest gap vs. AgentCard:** Stripe cards do not auto-cancel after one authorization the way AgentCard's do. Warden's own reconciler closes a Stripe-rail card after its first settled or pending transaction, reproducing single-use semantics operationally rather than natively. The dollar cap is still network-enforced either way; only the "auto-cancel after one charge" behavior is Warden-side for this rail. State this distinction plainly in any pitch or docs — do not imply Stripe natively single-uses cards.
+- `closeCard`: `issuing.cards.update(card_id, { status: 'canceled' })`.
+- `getCardDetails`: `issuing.cards.retrieve(card_id, { expand: ['number', 'cvc'] })`. Test-mode accounts can retrieve full PAN/CVC for integration-building purposes; this must never be attempted against a live-mode key without the account's PCI review being confirmed first.
+- `listTransactions`: merges `issuing.authorizations.list({ card: card_id })` (approved/declined/pending) with `issuing.transactions.list({ card: card_id })` (captured/settled), mapped onto the shared `UpstreamTxnStatus` enum.
+- `checkBalance`: computed, not native — the card's `all_time` limit minus the sum of its non-declined authorization amounts. Stripe has no single-card "balance" concept; this is Warden's derived equivalent.
+- Test-mode purchase simulation (the Stripe-rail analog of `mock_simulate_purchase`): `stripe.testHelpers.issuing.authorizations.create(...)` then `.capture(...)`. Real network calls against Stripe's sandbox, gated behind `STRIPE_E2E=1`, run by a human — never in CI, mirroring the AgentCard E2E gate in §2.7.
 
 ## 3. API / Interface Contracts
 
@@ -164,8 +184,9 @@ warden_start_task
             per_task_budget_cents) → persist task. NO card is minted here.
 
 warden_issue_card
-  in : { task_id: string, amount_cents: number, merchant?: string, category?: string }
-  out: { card_id, amount_cents, single_use: true, expires: '7d-unused' }
+  in : { task_id: string, amount_cents: number, merchant?: string, category?: string,
+         rail?: 'agentcard' | 'stripe' }   // v1.3, defaults to policy.default_rail
+  out: { card_id, amount_cents, single_use: true, expires: '7d-unused', rail }
   behavior: task must be 'active' → evaluateIssue (per-card cap incl. upstream $1–$50 clamp,
             merchant/category lists, per-merchant caps, remaining task budget, velocity,
             circuit state) → if amount > approval_threshold: create approval, error
@@ -327,7 +348,7 @@ Calendar (Ship Season 2026, 6 weeks, ships Aug 16): Week 1 = Jul 13–19 (Phases
 - **Never copy or reuse tokens from `~/.claude.json` or `~/.agent-cards/config.json`.** The AgentCard CLI's WorkOS tokens are rejected by the MCP endpoint (verified). Warden owns its own OAuth credentials at `WARDEN_CREDENTIALS_PATH`.
 - **Never update or delete receipts or policy_events.** Append-only. Policy changes create new versions.
 - **No security overclaims in any UI copy, README, or tool descriptions.** Banned words: "unhackable", "fraud detection", "AI security", "injection detection". Approved framing: "guardrails", "receipts", "policy blocked an off-policy purchase".
-- **No x402/AP2 integration in this build.** Cross-rail is a narrative for later; the only rail is AgentCard.
+- **No x402/AP2 integration in this build.** Two card rails (AgentCard, Stripe Issuing) are in scope as of v1.3; broader crypto/mandate rails (x402, AP2) remain a narrative for later.
 - **No proxying of checkout tools** (`buy`, `pay_checkout`, `fill_card`, `detect_checkout`). Warden controls issuance/closure only.
 - **No external SaaS dependencies** (no hosted DB, no auth provider, no analytics). Single-machine deployable.
 - **No test may require network access or live credentials by default.** MockUpstream covers everything; live E2E only under `AGENTCARD_E2E=1`, run by a human.
@@ -357,9 +378,11 @@ Calendar (Ship Season 2026, 6 weeks, ships Aug 16): Week 1 = Jul 13–19 (Phases
 - `nanoid` — ids for Warden-owned rows
 - `vitest` — tests
 - (dev) `eslint`, `prettier`
+- `stripe` — Stripe Node SDK, `upstream-stripe` only (v1.3)
 
 **External services**
 - AgentCard MCP — `https://mcp.agentcard.sh/mcp`, remote-only, OAuth 2.0 + PKCE (§2.7). TEST mode (sandbox flag) for all development and demos.
+- Stripe Issuing — `api.stripe.com`, test-mode secret key (§2.8), added v1.3 as the second rail.
 - Optional: any webhook receiver (Slack incoming webhook, ntfy) for approval notifications.
 
 **Environment variables**
@@ -373,5 +396,7 @@ Calendar (Ship Season 2026, 6 weeks, ships Aug 16): Week 1 = Jul 13–19 (Phases
 | `WARDEN_APPROVAL_WEBHOOK_URL` | no | — | Outbound JSON POST on new approval request |
 | `RECONCILE_INTERVAL_MS` | no | `30000` | Reconciler poll interval |
 | `APPROVAL_TTL_MINUTES` | no | `60` | Pending approvals expire after this |
-| `AGENTCARD_E2E` | no | — | Set to `1` to enable live TEST-mode E2E tests (human-run only) |
+| `AGENTCARD_E2E` | no | — | Set to `1` to enable live TEST-mode E2E tests against AgentCard (human-run only) |
+| `STRIPE_SECRET_KEY` | no | — | Test-mode Stripe secret key; required only when `rail=stripe` is used or `STRIPE_E2E=1` (v1.3) |
+| `STRIPE_E2E` | no | — | Set to `1` to enable live test-mode E2E tests against Stripe Issuing (human-run only, v1.3) |
 | `PORT` | no | `8787` | warden-api listen port |

@@ -16,10 +16,10 @@ let app: ReturnType<typeof createApiApp>;
 beforeEach(() => {
   db = openWardenDb(':memory:');
   upstream = new MockUpstream();
-  reconciler = new Reconciler({ repo: db.repo, upstream, log: () => undefined });
+  reconciler = new Reconciler({ repo: db.repo, upstreams: { agentcard: upstream }, log: () => undefined });
   service = new WardenService({
     repo: db.repo,
-    upstream,
+    upstreams: { agentcard: upstream },
     mode: 'test',
     reconcileNow: () => reconciler.runOnce(),
   });

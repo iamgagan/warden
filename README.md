@@ -65,6 +65,20 @@ node packages/mcp/dist/demo-agent.js ./warden-demo.db --fresh
 
 `scripts/seed-demo.mjs` seeds a richer multi-agent dataset for dashboard browsing.
 
+### Second rail: Stripe Issuing (test mode)
+
+Set `STRIPE_SECRET_KEY` (a test-mode `sk_test_...` key with Issuing enabled) before running
+warden-mcp or the demo agent, and `warden_issue_card` can mint on either rail via
+`rail: 'agentcard' | 'stripe'` (defaults to the policy's `default_rail`). With the key set, the
+demo agent's step ④ mints a real Stripe Issuing test-mode card and drives a real network
+authorization against Stripe's sandbox — same policy engine, same receipt schema, a different
+card network. See [SPEC §2.8](./SPEC.md#28-second-rail-stripe-issuing-added-v13) for the exact
+API shapes and the honest gap (Stripe cards don't auto-cancel after one authorization the way
+AgentCard's do; Warden's reconciler closes them operationally instead).
+
+`STRIPE_SECRET_KEY=sk_test_... node scripts/e2e-stripe.mjs` runs a human-triggered live check
+against the real Stripe sandbox (never CI), mirroring `scripts/e2e-real.mjs` for AgentCard.
+
 ### Point an agent at Warden
 
 ```json
@@ -87,6 +101,7 @@ node packages/mcp/dist/demo-agent.js ./warden-demo.db --fresh
 | `@warden/db` | SQLite (drizzle) schema, migrations, repositories |
 | `@warden/upstream` | OAuth 2.0 + PKCE token manager, real agent-cards MCP client |
 | `@warden/mock-agentcard` | deterministic in-process upstream for tests and demos |
+| `@warden/upstream-stripe` | second rail: `UpstreamClient` over Stripe Issuing (test mode) |
 | `@warden/mcp` | warden-mcp server (proxy + policy gate) + reconciler |
 | `@warden/api` | warden-api REST server, serves the dashboard |
 | `@warden/cli` | `warden auth` (interactive login) |

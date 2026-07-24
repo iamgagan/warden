@@ -1,5 +1,5 @@
 {
-  "name": "@warden/mcp",
+  "name": "@warden/upstream-stripe",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -15,17 +15,7 @@
     "build": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.0",
-    "@warden/core": "workspace:*",
-    "@warden/db": "workspace:*",
     "@warden/upstream": "workspace:*",
-    "zod": "^3.23.8",
-    "@warden/mock-agentcard": "workspace:*",
-    "@warden/upstream-stripe": "workspace:*",
     "stripe": "^17.4.0"
-  },
-  "bin": {
-    "warden-mcp": "./dist/main.js",
-    "warden-demo-agent": "./dist/demo-agent.js"
   }
 }

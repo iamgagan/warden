@@ -2,6 +2,8 @@
 // MockUpstream (in-process) both implement UpstreamClient; everything else in
 // Warden depends only on this interface.
 
+export type Rail = 'agentcard' | 'stripe';
+
 export type UpstreamCardState = 'open' | 'used' | 'closed' | 'expired';
 
 export type UpstreamTxnStatus =

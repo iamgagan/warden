@@ -27,6 +27,7 @@ function seedTaskWithCard() {
     amountCents: 1500,
     merchantHint: 'staples',
     sandbox: true,
+    rail: 'agentcard',
   });
   return { agent, task, card };
 }

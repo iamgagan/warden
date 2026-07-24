@@ -137,6 +137,7 @@ function receiptJson(r: {
   agentName: string;
   transactionStatus: string;
   decisionJson: string;
+  rail: string;
 }) {
   const decision = JSON.parse(r.decisionJson) as Record<string, unknown>;
   return {
@@ -147,6 +148,7 @@ function receiptJson(r: {
     currency: r.currency,
     category: r.category,
     card_id: r.cardId,
+    rail: r.rail,
     task_id: r.taskId,
     policy_id: r.policyId,
     agent: r.agentName,

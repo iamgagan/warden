@@ -34,6 +34,7 @@ describe('PolicyRulesSchema', () => {
       velocity: { max_cards_per_hour: 0, max_amount_cents_per_day: 0 },
       approval_threshold_cents: 0,
       card_ttl_minutes: 60,
+      default_rail: 'agentcard',
     });
   });
 

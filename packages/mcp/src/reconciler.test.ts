@@ -13,10 +13,10 @@ let reconciler: Reconciler;
 beforeEach(() => {
   db = openWardenDb(':memory:');
   upstream = new MockUpstream();
-  reconciler = new Reconciler({ repo: db.repo, upstream, log: () => undefined });
+  reconciler = new Reconciler({ repo: db.repo, upstreams: { agentcard: upstream }, log: () => undefined });
   service = new WardenService({
     repo: db.repo,
-    upstream,
+    upstreams: { agentcard: upstream },
     mode: 'test',
     reconcileNow: () => reconciler.runOnce(),
   });
@@ -102,7 +102,11 @@ describe('Reconciler (T8 done-check)', () => {
         .fn()
         .mockRejectedValue(new UpstreamError('refresh token dead', 'UPSTREAM_AUTH_REQUIRED')),
     } as unknown as UpstreamClient;
-    const failingReconciler = new Reconciler({ repo: db.repo, upstream: failing, log: () => undefined });
+    const failingReconciler = new Reconciler({
+      repo: db.repo,
+      upstreams: { agentcard: failing },
+      log: () => undefined,
+    });
     await failingReconciler.runOnce();
     expect(failingReconciler.status.upstream_auth).toBe('needs_login');
     expect(failingReconciler.status.last_error).toMatch(/refresh token dead/);
@@ -127,7 +131,11 @@ describe('Reconciler (T8 done-check)', () => {
         return original(cardId);
       }),
     } as unknown as UpstreamClient;
-    const flakyReconciler = new Reconciler({ repo: db.repo, upstream: flaky, log: () => undefined });
+    const flakyReconciler = new Reconciler({
+      repo: db.repo,
+      upstreams: { agentcard: flaky },
+      log: () => undefined,
+    });
 
     await flakyReconciler.runOnce();
     // the healthy card still produced its receipt despite the flaky one

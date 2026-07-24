@@ -1,5 +1,5 @@
 import type { CardRow, Repo } from '@warden/db';
-import { UpstreamError, type UpstreamClient, type UpstreamTxn } from '@warden/upstream';
+import { UpstreamError, type Rail, type UpstreamClient, type UpstreamTxn } from '@warden/upstream';
 
 export interface ReconcilerStatus {
   upstream_auth: 'ok' | 'needs_login';
@@ -9,7 +9,8 @@ export interface ReconcilerStatus {
 
 export interface ReconcilerOptions {
   repo: Repo;
-  upstream: UpstreamClient;
+  /** One UpstreamClient per rail (SPEC §2.8); each card is reconciled against its own rail. */
+  upstreams: Partial<Record<Rail, UpstreamClient>>;
   intervalMs?: number;
   log?: (line: string) => void;
 }
@@ -22,7 +23,7 @@ export interface ReconcilerOptions {
  */
 export class Reconciler {
   private readonly repo: Repo;
-  private readonly upstream: UpstreamClient;
+  private readonly upstreams: Partial<Record<Rail, UpstreamClient>>;
   private readonly intervalMs: number;
   private readonly log: (line: string) => void;
   private timer: NodeJS.Timeout | undefined;
@@ -36,7 +37,7 @@ export class Reconciler {
 
   constructor(opts: ReconcilerOptions) {
     this.repo = opts.repo;
-    this.upstream = opts.upstream;
+    this.upstreams = opts.upstreams;
     this.intervalMs = opts.intervalMs ?? Number(process.env['RECONCILE_INTERVAL_MS'] ?? 30_000);
     this.log = opts.log ?? ((line) => console.error(line));
   }
@@ -84,9 +85,31 @@ export class Reconciler {
   }
 
   private async reconcileCard(card: CardRow): Promise<void> {
-    const txns = await this.upstream.listTransactions(card.id);
+    const upstream = this.upstreams[card.rail];
+    if (!upstream) {
+      this.log(`[reconciler] card ${card.id}: rail '${card.rail}' is not configured, skipping`);
+      return;
+    }
+    const txns = await upstream.listTransactions(card.id);
     for (const txn of txns) {
       this.ingestTransaction(card, txn);
+    }
+    // Stripe Issuing cards don't auto-cancel after one authorized payment the
+    // way AgentCard's do (SPEC §2.8) — Warden closes them here to reproduce
+    // single-use semantics operationally once the first non-declined
+    // authorization lands. A decline alone doesn't consume the single use,
+    // matching AgentCard's "auto-cancel after one authorized payment".
+    const hasAuthorizedTxn = txns.some((t) => t.status !== 'DECLINED');
+    const stateNow = this.repo.getCard(card.id)?.state;
+    if (card.rail === 'stripe' && hasAuthorizedTxn && stateNow && stateNow !== 'closed') {
+      try {
+        await upstream.closeCard(card.id);
+        if (this.repo.getCard(card.id)?.state !== 'closed') {
+          this.repo.setCardState(card.id, 'closed');
+        }
+      } catch (err) {
+        this.log(`[reconciler] card ${card.id}: stripe single-use close failed: ${String(err)}`);
+      }
     }
   }
 

@@ -57,6 +57,7 @@ export const cards = sqliteTable(
     merchantHint: text('merchant_hint'),
     sandbox: integer('sandbox').notNull(),
     state: text('state', { enum: ['open', 'used', 'closed', 'expired'] }).notNull(),
+    rail: text('rail', { enum: ['agentcard', 'stripe'] }).notNull().default('agentcard'),
     createdAt: text('created_at').notNull(),
     closedAt: text('closed_at'),
   },

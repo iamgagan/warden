@@ -1,6 +1,6 @@
 # Warden — Build Status
 
-Updated: 2026-07-18 · Ship Season Week 1 · 12 commits · 88 tests green
+Updated: 2026-07-24 · multi-rail pivot ahead of investor demo · 99 tests green
 
 ## Done — Week 1: Receipts MVP (T1–T10)
 
@@ -40,6 +40,42 @@ README quickstart.
 4. Business statuses (`kyc_required`, `wallet_funding_required`, …) arrive as
    successful results with a `status` field → surfaced as clean errors.
 
+## Multi-rail pivot (2026-07-24, ahead of Monday investor demo)
+
+Added a second real `UpstreamClient` — `@warden/upstream-stripe`, over Stripe Issuing test
+mode — alongside AgentCard, to back the "rail-agnostic policy + receipt layer" pitch framing
+with real code instead of just an architectural claim. SPEC.md bumped to v1.3 (§2.8 documents
+the rail; §5's "only rail is AgentCard" constraint relaxed). `cards.rail` column added;
+`warden_issue_card` takes an optional `rail` param (defaults to the policy's `default_rail`);
+reconciler dispatches per-card by rail. Dashboard shows a rail badge per receipt. Demo agent's
+step ④ mints a real Stripe test-mode card and drives a real sandbox authorization when
+`STRIPE_SECRET_KEY` is set — same task, same policy engine, same receipt schema, a different
+card network. 99/99 offline tests green; live-verified against both real rails (AgentCard via
+the pre-existing `scripts/e2e-real.mjs`, Stripe via the new `scripts/e2e-stripe.mjs`).
+
+**Honest gap, stated plainly (also in SPEC §2.8 and the README):** Stripe Issuing cards don't
+auto-cancel after one authorization the way AgentCard's do. The dollar cap is still
+network-enforced by Stripe's `spending_limits` either way — only the "auto-cancel after one
+charge" behavior is Warden-side (the reconciler closes the card once its first non-declined
+authorization lands) rather than a native upstream guarantee for this rail.
+
+### Live-rail findings (Stripe Issuing, first real E2E, 2026-07-24 — all fixed & committed)
+
+1. Cardholder creation needs `individual.first_name` / `last_name` / `dob` /
+   `card_issuing.user_terms_acceptance` — a flat `name` field alone leaves the cardholder unable
+   to activate any card ("outstanding requirements").
+2. Every new/updated cardholder goes under automated review
+   (`requirements.disabled_reason: 'under_review'`); until it clears — normally a few seconds —
+   every authorization on their cards declines with `cardholder_verification_required`
+   regardless of spending limits → `StripeUpstream` now polls the cardholder after creation and
+   waits for review to clear (bounded, proceeds either way) before returning.
+3. A live timestamp (`Date.now()`) inside a payload sent under a fixed idempotency key breaks
+   idempotency on the very next process start, since Stripe requires byte-identical params to
+   reuse a key → the cardholder's `user_terms_acceptance.date` is now a fixed constant.
+4. `issuing.transactions.amount` is signed by ledger convention (negative = money left the
+   balance, i.e. a capture) — a settled $18.99 purchase reported as `-1899` → mapped through
+   `Math.abs()` since Warden's `amount_cents` is always a magnitude, never signed.
+
 ## Blockers (human-only)
 
 - [ ] **KYC on the AgentCard account** — required before creating any card,
@@ -64,6 +100,12 @@ README quickstart.
 
 - Demo reset order: **kill server → rm db → start server → refresh browser →
   run agent**. Deleting the db under a running server serves stale data.
+- The dashboard's own poll loop refreshes every 5s — no manual browser refresh needed once
+  it's open while the demo agent runs, but a hard reload (cmd+shift+r) is worth doing right
+  before a live demo in case a stale bundle/old drawer state is cached from a prior session.
+- For the dual-rail step: `export STRIPE_SECRET_KEY=sk_test_...` (test-mode, Issuing enabled,
+  some test funds added to the Issuing balance) before running the demo agent or warden-mcp.
+  Without it, step ④ prints a one-line skip notice and the rest of the demo runs unaffected.
 - Dashboard token lives in browser localStorage (`warden_api_token`); clear
   with `localStorage.removeItem('warden_api_token')` to see the gate again.
 - Demo run: `node packages/mcp/dist/demo-agent.js ./warden-demo.db --fresh`,

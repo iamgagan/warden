@@ -5,14 +5,20 @@ import {
   type PolicyRules,
 } from '@warden/core';
 import type { Repo, TaskRow } from '@warden/db';
-import { UpstreamError, type CardCredentials, type UpstreamClient } from '@warden/upstream';
+import {
+  UpstreamError,
+  type CardCredentials,
+  type Rail,
+  type UpstreamClient,
+} from '@warden/upstream';
 import { WardenToolError } from './errors.js';
 
 export type WardenMode = 'test' | 'live';
 
 export interface WardenServiceOptions {
   repo: Repo;
-  upstream: UpstreamClient;
+  /** One UpstreamClient per rail (SPEC §2.8). 'agentcard' must always be present. */
+  upstreams: Partial<Record<Rail, UpstreamClient>> & { agentcard: UpstreamClient };
   mode: WardenMode;
   /** Wired to the reconciler in T8; complete_task triggers one immediate pass. */
   reconcileNow?: () => Promise<void>;
@@ -25,14 +31,14 @@ export interface WardenServiceOptions {
  */
 export class WardenService {
   private readonly repo: Repo;
-  private readonly upstream: UpstreamClient;
+  private readonly upstreams: Partial<Record<Rail, UpstreamClient>>;
   private readonly mode: WardenMode;
   private readonly reconcileNow: () => Promise<void>;
   private readonly nowMs: () => number;
 
   constructor(opts: WardenServiceOptions) {
     this.repo = opts.repo;
-    this.upstream = opts.upstream;
+    this.upstreams = opts.upstreams;
     this.mode = opts.mode;
     this.reconcileNow = opts.reconcileNow ?? (async () => undefined);
     this.nowMs = opts.now ?? Date.now;
@@ -40,6 +46,17 @@ export class WardenService {
 
   get sandbox(): boolean {
     return this.mode !== 'live';
+  }
+
+  private upstreamFor(rail: Rail): UpstreamClient {
+    const client = this.upstreams[rail];
+    if (!client) {
+      throw new WardenToolError(
+        'UPSTREAM_ERROR',
+        `rail '${rail}' is not configured (missing credentials for this rail)`,
+      );
+    }
+    return client;
   }
 
   private loadPolicy(task: TaskRow): { rules: PolicyRules; policyId: string | null } {
@@ -91,9 +108,17 @@ export class WardenService {
     amount_cents: number;
     merchant?: string;
     category?: string;
-  }): Promise<{ card_id: string; amount_cents: number; single_use: true; expires: '7d-unused' }> {
+    rail?: Rail;
+  }): Promise<{
+    card_id: string;
+    amount_cents: number;
+    single_use: true;
+    expires: '7d-unused';
+    rail: Rail;
+  }> {
     const task = this.activeTaskOrThrow(input.task_id);
     const { rules, policyId } = this.loadPolicy(task);
+    const rail = input.rail ?? rules.default_rail;
 
     const hourAgo = new Date(this.nowMs() - 60 * 60 * 1000).toISOString();
     const dayAgo = new Date(this.nowMs() - 24 * 60 * 60 * 1000).toISOString();
@@ -139,7 +164,7 @@ export class WardenService {
 
     let cardId: string;
     try {
-      const created = await this.upstream.createCard({
+      const created = await this.upstreamFor(rail).createCard({
         amount_cents: decision.card_amount_cents,
         sandbox: this.sandbox,
       });
@@ -154,6 +179,7 @@ export class WardenService {
       amountCents: decision.card_amount_cents,
       merchantHint: input.merchant ?? null,
       sandbox: this.sandbox,
+      rail,
     });
     // Reserve the card amount against the task budget; the reconciler trues
     // this up to settled amounts (releases the unspent remainder).
@@ -176,6 +202,7 @@ export class WardenService {
       amount_cents: decision.card_amount_cents,
       single_use: true,
       expires: '7d-unused',
+      rail,
     };
   }
 
@@ -190,7 +217,7 @@ export class WardenService {
     this.activeTaskOrThrow(card.taskId);
     try {
       // Pass-through only: PAN/CVV stay in memory, never persisted or logged.
-      return await this.upstream.getCardDetails(input.card_id);
+      return await this.upstreamFor(card.rail).getCardDetails(input.card_id);
     } catch (err) {
       throw upstreamToolError(err);
     }
@@ -213,7 +240,7 @@ export class WardenService {
       const current = this.repo.getCard(card.id);
       if (current?.state !== 'open') continue;
       try {
-        await this.upstream.closeCard(card.id);
+        await this.upstreamFor(current.rail).closeCard(card.id);
       } catch (err) {
         throw upstreamToolError(err);
       }

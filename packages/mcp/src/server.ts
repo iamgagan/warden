@@ -50,12 +50,13 @@ export function createWardenMcpServer(service: WardenService): McpServer {
     'warden_issue_card',
     {
       description:
-        'Mint one single-use scoped card for one purchase inside a task. Policy is evaluated deterministically; the card amount is enforced at the card network.',
+        'Mint one single-use scoped card for one purchase inside a task. Policy is evaluated deterministically; the card amount is enforced at the card network. Optionally choose which card rail issues it (defaults to the policy\'s default_rail).',
       inputSchema: {
         task_id: z.string().min(1),
         amount_cents: z.number().int().positive(),
         merchant: z.string().optional(),
         category: z.string().optional(),
+        rail: z.enum(['agentcard', 'stripe']).optional(),
       },
     },
     async (args) => run(() => service.issueCard(args)),

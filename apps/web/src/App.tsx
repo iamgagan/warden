@@ -151,6 +151,7 @@ function Dashboard({ token, onUnauthorized }: { token: string; onUnauthorized: (
                 <th className="num">Amount</th>
                 <th>Intent</th>
                 <th>Card</th>
+                <th>Rail</th>
               </tr>
             </thead>
             <tbody>
@@ -162,6 +163,9 @@ function Dashboard({ token, onUnauthorized }: { token: string; onUnauthorized: (
                   <td className="num">{dollars(r.amount_cents)}</td>
                   <td className="intent">{r.intent}</td>
                   <td className="mono">{r.card_id}</td>
+                  <td>
+                    <RailBadge rail={r.rail} />
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -172,6 +176,10 @@ function Dashboard({ token, onUnauthorized }: { token: string; onUnauthorized: (
       {selected && <Drawer receipt={selected} onClose={() => setSelected(null)} />}
     </div>
   );
+}
+
+function RailBadge({ rail }: { rail: 'agentcard' | 'stripe' }) {
+  return <span className={`rail-badge rail-${rail}`}>{rail === 'agentcard' ? 'AgentCard' : 'Stripe'}</span>;
 }
 
 function Stat({ label, value }: { label: string; value: string }) {
@@ -210,7 +218,8 @@ function Drawer({ receipt, onClose }: { receipt: ReceiptDetail; onClose: () => v
         <h3>Card</h3>
         <p>
           <span className="mono">{receipt.card_id}</span> — single-use, auto-cancelled after this
-          authorization. Status: {receipt.transaction_status}.
+          authorization. Status: {receipt.transaction_status}. Issued on{' '}
+          <RailBadge rail={receipt.rail} /> rail.
         </p>
         {receipt.policy_id && (
           <p className="subtle">

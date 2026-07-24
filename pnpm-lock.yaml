@@ -11,6 +11,9 @@ importers:
       '@types/node':
         specifier: ^22.10.0
         version: 22.20.1
+      stripe:
+        specifier: ^17.4.0
+        version: 17.7.0
       typescript:
         specifier: ^5.5.4
         version: 5.9.3
@@ -122,6 +125,12 @@ importers:
       '@warden/upstream':
         specifier: workspace:*
         version: link:../upstream
+      '@warden/upstream-stripe':
+        specifier: workspace:*
+        version: link:../upstream-stripe
+      stripe:
+        specifier: ^17.4.0
+        version: 17.7.0
       zod:
         specifier: ^3.23.8
         version: 3.25.76
@@ -143,6 +152,15 @@ importers:
       zod:
         specifier: ^3.23.8
         version: 3.25.76
+
+  packages/upstream-stripe:
+    dependencies:
+      '@warden/upstream':
+        specifier: workspace:*
+        version: link:../upstream
+      stripe:
+        specifier: ^17.4.0
+        version: 17.7.0
 
 packages:
 
@@ -1358,6 +1376,10 @@ packages:
 
   strip-literal@3.1.0:
     resolution: {integrity: sha512-8r3mkIM/2+PpjHoOtiAW8Rg3jJLHaV7xPwG+YRGrv6FP0wwk/toTpATxWYOW0BKdWwl82VT2tFYi5DlROa0Mxg==}
+
+  stripe@17.7.0:
+    resolution: {integrity: sha512-aT2BU9KkizY9SATf14WhhYVv2uOapBWX0OFWF4xvcj1mPaNotlSc2CsxpS4DS46ZueSppmCF5BX1sNYBtwBvfw==}
+    engines: {node: '>=12.*'}
 
   tar-fs@2.1.5:
     resolution: {integrity: sha512-OboTd8mmMhZDNPV+UjQcK9yKAatXu2aJ+r1w4im1Otd4M4fl2hwvdoXUxIYHFTHWK/3y3FarBP70v3vwmGlOxw==}
@@ -2621,6 +2643,11 @@ snapshots:
   strip-literal@3.1.0:
     dependencies:
       js-tokens: 9.0.1
+
+  stripe@17.7.0:
+    dependencies:
+      '@types/node': 22.20.1
+      qs: 6.15.3
 
   tar-fs@2.1.5:
     dependencies:

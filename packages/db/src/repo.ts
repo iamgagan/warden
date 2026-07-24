@@ -38,6 +38,7 @@ export interface ReceiptListItem extends ReceiptRow {
   agentId: string;
   agentName: string;
   transactionStatus: TransactionRow['status'];
+  rail: CardRow['rail'];
 }
 
 export interface AgentRollup extends AgentRow {
@@ -181,11 +182,12 @@ export function createRepo(db: WardenDrizzle) {
 
     // ── cards ─────────────────────────────────────────────────────────────
     insertCard(input: {
-      id: string; // AgentCard card_id, verbatim
+      id: string; // upstream card_id, verbatim
       taskId: string;
       amountCents: number;
       merchantHint: string | null;
       sandbox: boolean;
+      rail: 'agentcard' | 'stripe';
     }): CardRow {
       const row: CardRow = {
         id: input.id,
@@ -194,6 +196,7 @@ export function createRepo(db: WardenDrizzle) {
         merchantHint: input.merchantHint,
         sandbox: input.sandbox ? 1 : 0,
         state: 'open',
+        rail: input.rail,
         createdAt: now(),
         closedAt: null,
       };
@@ -320,9 +323,11 @@ export function createRepo(db: WardenDrizzle) {
           transactionStatus: transactions.status,
           agentId: tasks.agentId,
           agentName: agents.name,
+          rail: cards.rail,
         })
         .from(receipts)
         .innerJoin(transactions, eq(receipts.transactionId, transactions.id))
+        .innerJoin(cards, eq(transactions.cardId, cards.id))
         .innerJoin(tasks, eq(receipts.taskId, tasks.id))
         .innerJoin(agents, eq(tasks.agentId, agents.id))
         .where(conditions.length ? and(...conditions) : undefined)

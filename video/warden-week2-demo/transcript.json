@@ -1,0 +1,712 @@
+[
+  {
+    "text": "Last",
+    "start": 0.35,
+    "end": 0.41
+  },
+  {
+    "text": "week,",
+    "start": 0.41,
+    "end": 0.87
+  },
+  {
+    "text": "my",
+    "start": 0.87,
+    "end": 1.04
+  },
+  {
+    "text": "agent",
+    "start": 1.04,
+    "end": 1.48
+  },
+  {
+    "text": "could",
+    "start": 1.48,
+    "end": 1.92
+  },
+  {
+    "text": "spend",
+    "start": 1.92,
+    "end": 2.3
+  },
+  {
+    "text": "money.",
+    "start": 2.3,
+    "end": 3.08
+  },
+  {
+    "text": "This",
+    "start": 3.08,
+    "end": 3.49
+  },
+  {
+    "text": "week,",
+    "start": 3.49,
+    "end": 3.85
+  },
+  {
+    "text": "I",
+    "start": 3.85,
+    "end": 3.93
+  },
+  {
+    "text": "decide",
+    "start": 3.93,
+    "end": 4.4
+  },
+  {
+    "text": "the",
+    "start": 4.4,
+    "end": 4.63
+  },
+  {
+    "text": "terms",
+    "start": 4.63,
+    "end": 5.02
+  },
+  {
+    "text": "and",
+    "start": 5.02,
+    "end": 5.25
+  },
+  {
+    "text": "it",
+    "start": 5.25,
+    "end": 5.38
+  },
+  {
+    "text": "can't",
+    "start": 5.38,
+    "end": 5.77
+  },
+  {
+    "text": "get",
+    "start": 5.77,
+    "end": 6.06
+  },
+  {
+    "text": "around",
+    "start": 6.06,
+    "end": 6.48
+  },
+  {
+    "text": "them.",
+    "start": 6.48,
+    "end": 7.14
+  },
+  {
+    "text": "Here's",
+    "start": 7.43,
+    "end": 7.57
+  },
+  {
+    "text": "the",
+    "start": 7.57,
+    "end": 7.78
+  },
+  {
+    "text": "policy",
+    "start": 7.78,
+    "end": 8.21
+  },
+  {
+    "text": "editor.",
+    "start": 8.21,
+    "end": 8.86
+  },
+  {
+    "text": "I",
+    "start": 8.88,
+    "end": 8.97
+  },
+  {
+    "text": "set",
+    "start": 8.97,
+    "end": 9.29
+  },
+  {
+    "text": "my",
+    "start": 9.29,
+    "end": 9.42
+  },
+  {
+    "text": "shopping",
+    "start": 9.42,
+    "end": 10.15
+  },
+  {
+    "text": "agents",
+    "start": 10.15,
+    "end": 10.7
+  },
+  {
+    "text": "budget",
+    "start": 10.7,
+    "end": 11.18
+  },
+  {
+    "text": "to",
+    "start": 11.24,
+    "end": 11.3
+  },
+  {
+    "text": "$40,",
+    "start": 11.42,
+    "end": 12.24
+  },
+  {
+    "text": "tell",
+    "start": 12.24,
+    "end": 12.39
+  },
+  {
+    "text": "its",
+    "start": 12.46,
+    "end": 12.64
+  },
+  {
+    "text": "staples",
+    "start": 12.77,
+    "end": 13.06
+  },
+  {
+    "text": "is",
+    "start": 13.06,
+    "end": 13.24
+  },
+  {
+    "text": "approved,",
+    "start": 13.24,
+    "end": 14.18
+  },
+  {
+    "text": "cap",
+    "start": 14.18,
+    "end": 14.34
+  },
+  {
+    "text": "that",
+    "start": 14.34,
+    "end": 14.55
+  },
+  {
+    "text": "merchant",
+    "start": 14.6,
+    "end": 14.96
+  },
+  {
+    "text": "at",
+    "start": 14.96,
+    "end": 15.32
+  },
+  {
+    "text": "$25.",
+    "start": 15.32,
+    "end": 16.44
+  },
+  {
+    "text": "Save.",
+    "start": 16.85,
+    "end": 17.4
+  },
+  {
+    "text": "New",
+    "start": 17.4,
+    "end": 17.85
+  },
+  {
+    "text": "version",
+    "start": 17.85,
+    "end": 18.35
+  },
+  {
+    "text": "live",
+    "start": 18.45,
+    "end": 18.73
+  },
+  {
+    "text": "immediately,",
+    "start": 18.73,
+    "end": 19.86
+  },
+  {
+    "text": "no",
+    "start": 19.86,
+    "end": 20.41
+  },
+  {
+    "text": "redeploy.",
+    "start": 20.41,
+    "end": 20.97
+  },
+  {
+    "text": "Now",
+    "start": 20.97,
+    "end": 21.57
+  },
+  {
+    "text": "watch",
+    "start": 21.57,
+    "end": 21.72
+  },
+  {
+    "text": "the",
+    "start": 21.72,
+    "end": 21.93
+  },
+  {
+    "text": "agent",
+    "start": 21.93,
+    "end": 22.28
+  },
+  {
+    "text": "try",
+    "start": 22.28,
+    "end": 22.49
+  },
+  {
+    "text": "to",
+    "start": 22.49,
+    "end": 22.63
+  },
+  {
+    "text": "buy",
+    "start": 22.63,
+    "end": 22.84
+  },
+  {
+    "text": "from",
+    "start": 22.84,
+    "end": 23.12
+  },
+  {
+    "text": "a",
+    "start": 23.12,
+    "end": 23.19
+  },
+  {
+    "text": "merchant",
+    "start": 23.19,
+    "end": 23.48
+  },
+  {
+    "text": "that",
+    "start": 23.48,
+    "end": 24.13
+  },
+  {
+    "text": "isn't",
+    "start": 24.13,
+    "end": 24.32
+  },
+  {
+    "text": "on",
+    "start": 24.39,
+    "end": 24.53
+  },
+  {
+    "text": "the",
+    "start": 24.53,
+    "end": 24.67
+  },
+  {
+    "text": "list,",
+    "start": 25.02,
+    "end": 25.24
+  },
+  {
+    "text": "a",
+    "start": 25.24,
+    "end": 25.31
+  },
+  {
+    "text": "prompt",
+    "start": 25.31,
+    "end": 25.75
+  },
+  {
+    "text": "injected",
+    "start": 25.75,
+    "end": 26.3
+  },
+  {
+    "text": "page",
+    "start": 26.73,
+    "end": 26.74
+  },
+  {
+    "text": "telling",
+    "start": 26.74,
+    "end": 27.48
+  },
+  {
+    "text": "it",
+    "start": 27.48,
+    "end": 27.69
+  },
+  {
+    "text": "to",
+    "start": 27.69,
+    "end": 27.9
+  },
+  {
+    "text": "buy",
+    "start": 27.9,
+    "end": 28.15
+  },
+  {
+    "text": "a",
+    "start": 28.23,
+    "end": 28.32
+  },
+  {
+    "text": "gift",
+    "start": 28.32,
+    "end": 28.62
+  },
+  {
+    "text": "card.",
+    "start": 28.62,
+    "end": 29.49
+  },
+  {
+    "text": "Next",
+    "start": 29.49,
+    "end": 29.94
+  },
+  {
+    "text": "before",
+    "start": 29.94,
+    "end": 30.48
+  },
+  {
+    "text": "a",
+    "start": 30.53,
+    "end": 30.62
+  },
+  {
+    "text": "card",
+    "start": 30.62,
+    "end": 31.02
+  },
+  {
+    "text": "ever",
+    "start": 31.02,
+    "end": 31.35
+  },
+  {
+    "text": "existed,",
+    "start": 31.43,
+    "end": 32.32
+  },
+  {
+    "text": "no",
+    "start": 32.49,
+    "end": 32.52
+  },
+  {
+    "text": "card,",
+    "start": 32.52,
+    "end": 33.03
+  },
+  {
+    "text": "nothing",
+    "start": 33.41,
+    "end": 33.82
+  },
+  {
+    "text": "to",
+    "start": 33.82,
+    "end": 34.02
+  },
+  {
+    "text": "steal.",
+    "start": 34.02,
+    "end": 34.83
+  },
+  {
+    "text": "Every",
+    "start": 34.83,
+    "end": 35.25
+  },
+  {
+    "text": "approved",
+    "start": 35.25,
+    "end": 35.74
+  },
+  {
+    "text": "charge",
+    "start": 35.85,
+    "end": 36.21
+  },
+  {
+    "text": "still",
+    "start": 36.21,
+    "end": 36.56
+  },
+  {
+    "text": "lands",
+    "start": 36.58,
+    "end": 36.93
+  },
+  {
+    "text": "here,",
+    "start": 36.93,
+    "end": 37.26
+  },
+  {
+    "text": "the",
+    "start": 37.35,
+    "end": 37.53
+  },
+  {
+    "text": "merchant,",
+    "start": 37.81,
+    "end": 38.26
+  },
+  {
+    "text": "the",
+    "start": 38.34,
+    "end": 38.37
+  },
+  {
+    "text": "amount,",
+    "start": 38.73,
+    "end": 39.06
+  },
+  {
+    "text": "and",
+    "start": 39.08,
+    "end": 39.27
+  },
+  {
+    "text": "the",
+    "start": 39.28,
+    "end": 39.47
+  },
+  {
+    "text": "exact",
+    "start": 39.5,
+    "end": 39.84
+  },
+  {
+    "text": "instruction",
+    "start": 39.85,
+    "end": 40.72
+  },
+  {
+    "text": "that",
+    "start": 41.13,
+    "end": 41.14
+  },
+  {
+    "text": "caused",
+    "start": 41.14,
+    "end": 41.77
+  },
+  {
+    "text": "it.",
+    "start": 41.77,
+    "end": 42.3
+  },
+  {
+    "text": "This",
+    "start": 42.3,
+    "end": 42.73
+  },
+  {
+    "text": "is",
+    "start": 42.73,
+    "end": 42.83
+  },
+  {
+    "text": "the",
+    "start": 42.83,
+    "end": 42.99
+  },
+  {
+    "text": "record",
+    "start": 43.08,
+    "end": 43.59
+  },
+  {
+    "text": "visa",
+    "start": 43.59,
+    "end": 43.9
+  },
+  {
+    "text": "and",
+    "start": 43.95,
+    "end": 44.15
+  },
+  {
+    "text": "master",
+    "start": 44.23,
+    "end": 44.62
+  },
+  {
+    "text": "card",
+    "start": 44.62,
+    "end": 44.74
+  },
+  {
+    "text": "now",
+    "start": 44.74,
+    "end": 45.29
+  },
+  {
+    "text": "require",
+    "start": 45.29,
+    "end": 45.83
+  },
+  {
+    "text": "for",
+    "start": 45.83,
+    "end": 46.11
+  },
+  {
+    "text": "agentic",
+    "start": 46.21,
+    "end": 46.71
+  },
+  {
+    "text": "payments.",
+    "start": 46.71,
+    "end": 47.71
+  },
+  {
+    "text": "And",
+    "start": 47.71,
+    "end": 48.13
+  },
+  {
+    "text": "this",
+    "start": 48.13,
+    "end": 48.21
+  },
+  {
+    "text": "same",
+    "start": 48.21,
+    "end": 48.49
+  },
+  {
+    "text": "policy,",
+    "start": 48.49,
+    "end": 49.05
+  },
+  {
+    "text": "same",
+    "start": 49.05,
+    "end": 49.3
+  },
+  {
+    "text": "receipt,",
+    "start": 49.35,
+    "end": 49.96
+  },
+  {
+    "text": "now",
+    "start": 49.96,
+    "end": 50.06
+  },
+  {
+    "text": "works",
+    "start": 50.16,
+    "end": 50.17
+  },
+  {
+    "text": "across",
+    "start": 50.7,
+    "end": 50.89
+  },
+  {
+    "text": "two",
+    "start": 50.95,
+    "end": 51.14
+  },
+  {
+    "text": "different",
+    "start": 51.15,
+    "end": 51.78
+  },
+  {
+    "text": "card",
+    "start": 51.78,
+    "end": 52.06
+  },
+  {
+    "text": "networks,",
+    "start": 52.06,
+    "end": 52.75
+  },
+  {
+    "text": "not",
+    "start": 52.76,
+    "end": 52.86
+  },
+  {
+    "text": "just",
+    "start": 53.29,
+    "end": 53.45
+  },
+  {
+    "text": "one.",
+    "start": 53.45,
+    "end": 54.31
+  },
+  {
+    "text": "More",
+    "start": 54.73,
+    "end": 54.76
+  },
+  {
+    "text": "on",
+    "start": 54.76,
+    "end": 54.98
+  },
+  {
+    "text": "that",
+    "start": 54.98,
+    "end": 55.42
+  },
+  {
+    "text": "soon.",
+    "start": 55.42,
+    "end": 56.15
+  },
+  {
+    "text": "you",
+    "start": 56.15,
+    "end": 56.61
+  },
+  {
+    "text": "set",
+    "start": 56.61,
+    "end": 56.68
+  },
+  {
+    "text": "the",
+    "start": 56.68,
+    "end": 56.87
+  },
+  {
+    "text": "terms",
+    "start": 56.96,
+    "end": 57.31
+  },
+  {
+    "text": "every",
+    "start": 57.31,
+    "end": 57.7
+  },
+  {
+    "text": "dollar",
+    "start": 57.7,
+    "end": 58.2
+  },
+  {
+    "text": "explained.",
+    "start": 58.2,
+    "end": 58.91
+  }
+]

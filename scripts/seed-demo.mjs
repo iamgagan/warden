@@ -1,100 +1,130 @@
-// Demo seed: drives the real WardenService + Reconciler against MockUpstream
-// and writes warden.db. Run `node scripts/seed-demo.mjs [db-path]` from the
-// repo root after `pnpm build`, then start warden-api to browse the result.
+// Seeds a polished mandate-first demo against the real service, repository,
+// reconciler, and mock payment rail. Run after `pnpm build`.
+import { rmSync } from 'node:fs';
+import { PolicyRulesSchema } from '../packages/core/dist/index.js';
 import { openWardenDb } from '../packages/db/dist/index.js';
 import { MockUpstream } from '../packages/mock-agentcard/dist/index.js';
 import { Reconciler, WardenService } from '../packages/mcp/dist/index.js';
-import { PolicyRulesSchema } from '../packages/core/dist/index.js';
-import { rmSync } from 'node:fs';
 
-const dbPath = process.argv[2] ?? './warden.db';
+const dbPath = process.argv[2] ?? './warden-demo.db';
 for (const suffix of ['', '-wal', '-shm']) rmSync(dbPath + suffix, { force: true });
 
 const db = openWardenDb(dbPath);
 const upstream = new MockUpstream();
-const reconciler = new Reconciler({ repo: db.repo, upstream, log: () => undefined });
+const upstreams = { agentcard: upstream };
+const reconciler = new Reconciler({ repo: db.repo, upstreams, log: () => undefined });
 const service = new WardenService({
   repo: db.repo,
-  upstream,
+  upstreams,
   mode: 'test',
   reconcileNow: () => reconciler.runOnce(),
+  actorAgentName: 'procurement-agent',
 });
 
-// A policy for the shopping agent: modest caps, one blocked merchant.
-const shopper = db.repo.getOrCreateAgent('shopping-agent', 'personal shopping agent');
+const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+const agent = db.repo.getOrCreateAgent(
+  'procurement-agent',
+  'Purchases bounded operational supplies',
+);
 db.repo.setActivePolicy(
-  shopper.id,
+  agent.id,
   JSON.stringify(
     PolicyRulesSchema.parse({
       per_card_cap_cents: 5000,
-      per_task_budget_cents: 8000,
+      per_task_budget_cents: 15_000,
       blocked_merchants: ['sketchy-gift-cards.example'],
+      velocity: { max_cards_per_hour: 8, max_amount_cents_per_day: 20_000 },
     }),
   ),
 );
 
-const purchases = [
-  {
-    agent: 'shopping-agent',
-    intent: 'Restock office supplies: printer paper and pens, under $40 total',
-    buys: [
-      { merchant: 'Staples', amount: 1899 },
-      { merchant: 'Staples', amount: 1249 },
-    ],
-  },
-  {
-    agent: 'shopping-agent',
-    intent: 'Order Friday team lunch from the usual place, budget $50',
-    buys: [{ merchant: 'DoorDash', amount: 4650 }],
-  },
-  {
-    agent: 'research-agent',
-    intent: 'Buy the PDF of the NIST agentic-payments whitepaper',
-    buys: [{ merchant: 'NIST Bookstore', amount: 350 }],
-  },
-];
+const createActive = (input) =>
+  db.repo.activateMandate(
+    db.repo.createMandate({
+      agentId: agent.id,
+      rail: 'agentcard',
+      createdBy: 'Gagan Singh',
+      expiresAt,
+      ...input,
+    }).id,
+    'Gagan Singh',
+  );
 
-for (const scenario of purchases) {
-  const task = service.startTask({
-    agent_name: scenario.agent,
-    intent: scenario.intent,
-    budget_cents: 8000,
-  });
-  for (const buy of scenario.buys) {
-    const card = await service.issueCard({
-      task_id: task.task_id,
-      amount_cents: buy.amount,
-      merchant: buy.merchant,
-    });
-    upstream.simulatePurchase(card.card_id, { merchant: buy.merchant, amount_cents: buy.amount });
-  }
-  await reconciler.runOnce();
-  await service.completeTask({ task_id: task.task_id });
-}
-
-// The demo-critical moments: a policy block at issuance and a network decline.
-const attack = service.startTask({
-  agent_name: 'shopping-agent',
-  intent: 'Order Friday team lunch from the usual place, budget $50',
+const staples = createActive({
+  purpose: 'Restock printer paper for the New York office',
+  merchant: 'Staples',
+  amountLimitCents: 4000,
+  perTransactionLimitCents: 2500,
+  maxTransactions: 3,
 });
-try {
-  await service.issueCard({
-    task_id: attack.task_id,
-    amount_cents: 4900,
-    merchant: 'sketchy-gift-cards.example',
-  });
-} catch (err) {
-  console.log('policy block (issuance):', err.message);
-}
-const overCard = await service.issueCard({
-  task_id: attack.task_id,
-  amount_cents: 1500,
-  merchant: 'DoorDash',
+const staplesCard = await service.issueCard({
+  task_id: staples.taskId,
+  amount_cents: 1899,
+  merchant: 'Staples',
+  idempotency_key: 'staples-paper-order',
 });
-// merchant tries to charge more than the card holds → declines at the network
-upstream.simulatePurchase(overCard.card_id, { merchant: 'DoorDash', amount_cents: 9900 });
+upstream.simulatePurchase(staplesCard.card_id, {
+  merchant: 'STAPLES',
+  amount_cents: 1899,
+});
 await reconciler.runOnce();
 
-const stats = db.repo.stats();
-console.log('seeded', dbPath, JSON.stringify(stats));
+const nist = createActive({
+  purpose: 'Purchase the NIST agentic payments research brief',
+  merchant: 'NIST Bookstore',
+  amountLimitCents: 1200,
+  perTransactionLimitCents: 1200,
+  maxTransactions: 1,
+});
+const nistCard = await service.issueCard({
+  task_id: nist.taskId,
+  amount_cents: 350,
+  merchant: 'NIST Bookstore',
+  idempotency_key: 'nist-brief',
+});
+upstream.simulatePurchase(nistCard.card_id, {
+  merchant: 'NIST BOOKSTORE',
+  amount_cents: 350,
+});
+await reconciler.runOnce();
+
+const lunch = createActive({
+  purpose: 'Order Friday team lunch for the product group',
+  merchant: 'DoorDash',
+  amountLimitCents: 5000,
+  perTransactionLimitCents: 5000,
+  maxTransactions: 1,
+});
+
+try {
+  await service.issueCard({
+    task_id: lunch.taskId,
+    amount_cents: 1999,
+    merchant: 'sketchy-gift-cards.example',
+    idempotency_key: 'prompt-injection-attempt',
+  });
+} catch {
+  // Expected: the mandate and policy both fail closed.
+}
+
+db.repo.createMandate({
+  agentId: agent.id,
+  purpose: 'Renew the shared design asset subscription',
+  merchant: 'Figma',
+  amountLimitCents: 1500,
+  perTransactionLimitCents: 1500,
+  maxTransactions: 1,
+  expiresAt,
+  rail: 'auto',
+  createdBy: 'Gagan Singh',
+});
+
+console.log(
+  JSON.stringify({
+    db: dbPath,
+    mandates: db.repo.listMandates().length,
+    evidence: db.repo.listEvidence({ limit: 100 }).length,
+    stats: db.repo.stats(),
+  }),
+);
 db.close();

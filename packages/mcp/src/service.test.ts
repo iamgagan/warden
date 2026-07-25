@@ -1,8 +1,8 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { PolicyRulesSchema } from '@warden/core';
 import { openWardenDb, type WardenDb } from '@warden/db';
 import { MockUpstream } from '@warden/mock-agentcard';
-import type { UpstreamClient } from '@warden/upstream';
+import { UpstreamError, type UpstreamClient } from '@warden/upstream';
 import { WardenToolError } from './errors.js';
 import { WardenService } from './service.js';
 
@@ -45,11 +45,19 @@ function fakeRail(prefix: string): UpstreamClient {
 let db: WardenDb;
 let upstream: MockUpstream;
 let service: WardenService;
+const futureExpiry = (): string =>
+  new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
 
 beforeEach(() => {
   db = openWardenDb(':memory:');
   upstream = new MockUpstream();
-  service = new WardenService({ repo: db.repo, upstreams: { agentcard: upstream }, mode: 'test' });
+  service = new WardenService({
+    repo: db.repo,
+    upstreams: { agentcard: upstream },
+    mode: 'test',
+    actorAgentName: 'procurement-agent',
+    allowLegacyTasks: true,
+  });
 });
 
 const setPolicy = (agentName: string, rules: object) => {
@@ -128,6 +136,21 @@ describe('warden_issue_card', () => {
     expect(db.repo.getTask(task_id)?.spentCents).toBe(4000);
   });
 
+  it('atomically prevents simultaneous issuance from overspending a task', async () => {
+    const { task_id } = service.startTask({
+      agent_name: 'shopper',
+      intent: 'buy supplies',
+      budget_cents: 1000,
+    });
+    const results = await Promise.allSettled([
+      service.issueCard({ task_id, amount_cents: 800 }),
+      service.issueCard({ task_id, amount_cents: 800 }),
+    ]);
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(db.repo.getTask(task_id)?.spentCents).toBe(800);
+    expect(await upstream.listCards()).toHaveLength(1);
+  });
+
   it('stubs the approval path as POLICY_BLOCKED for now (T15 ships it)', async () => {
     setPolicy('shopper', { approval_threshold_cents: 1000 });
     const { task_id } = service.startTask({ agent_name: 'shopper', intent: 'buy a monitor' });
@@ -155,6 +178,437 @@ describe('warden_issue_card', () => {
     await service.completeTask({ task_id });
     await expect(service.issueCard({ task_id, amount_cents: 100 })).rejects.toMatchObject({
       code: 'TASK_NOT_ACTIVE',
+    });
+  });
+});
+
+describe('mandate authority', () => {
+  it('keeps self-declared legacy tasks behind an explicit compatibility flag', () => {
+    const mandateOnly = new WardenService({
+      repo: db.repo,
+      upstreams: { agentcard: upstream },
+      mode: 'test',
+      actorAgentName: 'procurement-agent',
+    });
+    expect(() =>
+      mandateOnly.startTask({ agent_name: 'procurement-agent', intent: 'self-declared spend' }),
+    ).toThrow(/operator-approved authority is required/);
+  });
+
+  it('starts only active mandates and requires the declared merchant', async () => {
+    const agent = db.repo.getOrCreateAgent('procurement-agent');
+    const draft = db.repo.createMandate({
+      agentId: agent.id,
+      purpose: 'Buy paper',
+      merchant: 'Staples',
+      amountLimitCents: 4000,
+      perTransactionLimitCents: 2500,
+      maxTransactions: 2,
+      expiresAt: futureExpiry(),
+      rail: 'agentcard',
+      createdBy: 'local-operator',
+    });
+    expect(() => service.startMandateTask({ mandate_id: draft.id })).toThrow(/draft/);
+
+    const active = db.repo.activateMandate(draft.id, 'local-operator');
+    expect(service.startMandateTask({ mandate_id: active.id })).toMatchObject({
+      mandate_id: active.id,
+      task_id: active.taskId,
+      merchant: 'Staples',
+      amount_available_cents: 4000,
+    });
+    await expect(
+      service.issueCard({
+        task_id: active.taskId!,
+        amount_cents: 1000,
+        merchant: 'Office Depot',
+        idempotency_key: 'checkout-1',
+      }),
+    ).rejects.toMatchObject({ code: 'POLICY_BLOCKED' });
+  });
+
+  it('lets the bound agent discover only its own active mandates', () => {
+    const procurement = db.repo.getOrCreateAgent('procurement-agent');
+    const research = db.repo.getOrCreateAgent('research-agent');
+    const own = db.repo.activateMandate(
+      db.repo.createMandate({
+        agentId: procurement.id,
+        purpose: 'Buy paper',
+        merchant: 'Staples',
+        amountLimitCents: 2000,
+        perTransactionLimitCents: 1000,
+        maxTransactions: 2,
+        expiresAt: futureExpiry(),
+        rail: 'agentcard',
+        createdBy: 'local-operator',
+      }).id,
+      'local-operator',
+    );
+    db.repo.activateMandate(
+      db.repo.createMandate({
+        agentId: research.id,
+        purpose: 'Buy a report',
+        merchant: 'Gartner',
+        amountLimitCents: 5000,
+        perTransactionLimitCents: 5000,
+        maxTransactions: 1,
+        expiresAt: futureExpiry(),
+        rail: 'agentcard',
+        createdBy: 'local-operator',
+      }).id,
+      'local-operator',
+    );
+
+    expect(service.listMyMandates()).toMatchObject({
+      agent: 'procurement-agent',
+      mandates: [
+        {
+          mandate_id: own.id,
+          merchant: 'Staples',
+          amount_available_cents: 2000,
+          transactions_remaining: 2,
+        },
+      ],
+    });
+  });
+
+  it('binds mandate authority to the configured MCP agent identity', async () => {
+    const agent = db.repo.getOrCreateAgent('procurement-agent');
+    const active = db.repo.activateMandate(
+      db.repo.createMandate({
+        agentId: agent.id,
+        purpose: 'Buy paper',
+        merchant: 'Staples',
+        amountLimitCents: 2000,
+        perTransactionLimitCents: 2000,
+        maxTransactions: 1,
+        expiresAt: futureExpiry(),
+        rail: 'agentcard',
+        createdBy: 'local-operator',
+      }).id,
+      'local-operator',
+    );
+    const wrongAgent = new WardenService({
+      repo: db.repo,
+      upstreams: { agentcard: upstream },
+      mode: 'test',
+      actorAgentName: 'research-agent',
+    });
+
+    expect(() => wrongAgent.startMandateTask({ mandate_id: active.id })).toThrow(
+      /belongs to procurement-agent/,
+    );
+    await expect(
+      wrongAgent.issueCard({
+        task_id: active.taskId!,
+        amount_cents: 1000,
+        merchant: 'Staples',
+        idempotency_key: 'wrong-agent',
+      }),
+    ).rejects.toMatchObject({
+      code: 'POLICY_BLOCKED',
+      details: { reason: 'wrong_agent' },
+    });
+    expect(await upstream.listCards()).toHaveLength(0);
+  });
+
+  it('applies the identity binding to precheck, credentials, and lifecycle operations', async () => {
+    const agent = db.repo.getOrCreateAgent('procurement-agent');
+    const active = db.repo.activateMandate(
+      db.repo.createMandate({
+        agentId: agent.id,
+        purpose: 'Buy paper',
+        merchant: 'Staples',
+        amountLimitCents: 2000,
+        perTransactionLimitCents: 2000,
+        maxTransactions: 2,
+        expiresAt: futureExpiry(),
+        rail: 'agentcard',
+        createdBy: 'local-operator',
+      }).id,
+      'local-operator',
+    );
+    const card = await service.issueCard({
+      task_id: active.taskId!,
+      amount_cents: 1000,
+      merchant: 'Staples',
+      idempotency_key: 'bound-card',
+    });
+    const wrongAgent = new WardenService({
+      repo: db.repo,
+      upstreams: { agentcard: upstream },
+      mode: 'test',
+      actorAgentName: 'research-agent',
+    });
+
+    expect(() =>
+      wrongAgent.precheckPurchase({
+        task_id: active.taskId!,
+        merchant: 'Staples',
+        amount_cents: 500,
+      }),
+    ).toThrow(/belongs to procurement-agent/);
+    await expect(wrongAgent.getCardDetails({ card_id: card.card_id })).rejects.toMatchObject({
+      details: { reason: 'wrong_agent' },
+    });
+    await expect(wrongAgent.completeTask({ task_id: active.taskId! })).rejects.toMatchObject({
+      details: { reason: 'wrong_agent' },
+    });
+  });
+
+  it('prechecks mandate terms and never reports an out-of-scope purchase as allowed', () => {
+    const agent = db.repo.getOrCreateAgent('procurement-agent');
+    const active = db.repo.activateMandate(
+      db.repo.createMandate({
+        agentId: agent.id,
+        purpose: 'Buy paper',
+        merchant: 'Staples',
+        amountLimitCents: 2000,
+        perTransactionLimitCents: 1200,
+        maxTransactions: 2,
+        expiresAt: futureExpiry(),
+        rail: 'agentcard',
+        createdBy: 'local-operator',
+      }).id,
+      'local-operator',
+    );
+
+    expect(
+      service.precheckPurchase({
+        task_id: active.taskId!,
+        merchant: 'Office Depot',
+        amount_cents: 1500,
+      }),
+    ).toMatchObject({
+      decision: 'block',
+      reasons: expect.arrayContaining([
+        expect.stringContaining('does not match mandate payee'),
+        expect.stringContaining('per-transaction limit'),
+      ]),
+    });
+  });
+
+  it('keeps reusable mandate lifecycle under operator control', async () => {
+    const agent = db.repo.getOrCreateAgent('procurement-agent');
+    const active = db.repo.activateMandate(
+      db.repo.createMandate({
+        agentId: agent.id,
+        purpose: 'Buy office supplies',
+        merchant: 'Staples',
+        amountLimitCents: 5000,
+        perTransactionLimitCents: 2500,
+        maxTransactions: 3,
+        expiresAt: futureExpiry(),
+        rail: 'agentcard',
+        createdBy: 'local-operator',
+      }).id,
+      'local-operator',
+    );
+
+    await expect(service.completeTask({ task_id: active.taskId! })).rejects.toMatchObject({
+      code: 'POLICY_BLOCKED',
+      details: { reason: 'mandate_controlled_lifecycle' },
+    });
+    expect(db.repo.getTask(active.taskId!)?.status).toBe('active');
+    expect(db.repo.getMandate(active.id)?.status).toBe('active');
+  });
+
+  it('denies credential access after mandate expiry', async () => {
+    const agent = db.repo.getOrCreateAgent('procurement-agent');
+    const active = db.repo.activateMandate(
+      db.repo.createMandate({
+        agentId: agent.id,
+        purpose: 'Buy paper',
+        merchant: 'Staples',
+        amountLimitCents: 2000,
+        perTransactionLimitCents: 2000,
+        maxTransactions: 1,
+        expiresAt: new Date(Date.now() + 1_000).toISOString(),
+        rail: 'agentcard',
+        createdBy: 'local-operator',
+      }).id,
+      'local-operator',
+    );
+    const card = await service.issueCard({
+      task_id: active.taskId!,
+      amount_cents: 1000,
+      merchant: 'Staples',
+      idempotency_key: 'expiring-card',
+    });
+
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(Date.now() + 2_000);
+      await expect(service.getCardDetails({ card_id: card.card_id })).rejects.toMatchObject({
+        code: 'TASK_NOT_ACTIVE',
+        details: { status: 'expired' },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('treats an upstream-minimum amount retry as the same canonical request', async () => {
+    const agent = db.repo.getOrCreateAgent('procurement-agent');
+    const active = db.repo.activateMandate(
+      db.repo.createMandate({
+        agentId: agent.id,
+        purpose: 'Buy a small sample',
+        merchant: 'Staples',
+        amountLimitCents: 500,
+        perTransactionLimitCents: 500,
+        maxTransactions: 1,
+        expiresAt: futureExpiry(),
+        rail: 'agentcard',
+        createdBy: 'local-operator',
+      }).id,
+      'local-operator',
+    );
+    const request = {
+      task_id: active.taskId!,
+      amount_cents: 50,
+      merchant: 'Staples',
+      idempotency_key: 'minimum-clamp',
+    };
+    const first = await service.issueCard(request);
+    const retry = await service.issueCard(request);
+    expect(retry).toEqual(first);
+    expect(first.amount_cents).toBe(100);
+    expect(await upstream.listCards()).toHaveLength(1);
+  });
+
+  it('returns the same card for an idempotent retry and never double reserves', async () => {
+    const agent = db.repo.getOrCreateAgent('procurement-agent');
+    const active = db.repo.activateMandate(
+      db.repo.createMandate({
+        agentId: agent.id,
+        purpose: 'Buy paper',
+        merchant: 'Staples',
+        amountLimitCents: 2000,
+        perTransactionLimitCents: 2000,
+        maxTransactions: 1,
+        expiresAt: futureExpiry(),
+        rail: 'agentcard',
+        createdBy: 'local-operator',
+      }).id,
+      'local-operator',
+    );
+
+    const first = await service.issueCard({
+      task_id: active.taskId!,
+      amount_cents: 1500,
+      merchant: 'Staples',
+      idempotency_key: 'checkout-42',
+    });
+    const retry = await service.issueCard({
+      task_id: active.taskId!,
+      amount_cents: 1500,
+      merchant: 'Staples',
+      idempotency_key: 'checkout-42',
+    });
+
+    expect(retry.card_id).toBe(first.card_id);
+    expect(await upstream.listCards()).toHaveLength(1);
+    expect(db.repo.getMandate(active.id)).toMatchObject({
+      reservedCents: 1500,
+      transactionCount: 1,
+    });
+  });
+
+  it('does not mint a second card for a simultaneous same-key retry', async () => {
+    const agent = db.repo.getOrCreateAgent('procurement-agent');
+    const active = db.repo.activateMandate(
+      db.repo.createMandate({
+        agentId: agent.id,
+        purpose: 'Buy paper',
+        merchant: 'Staples',
+        amountLimitCents: 2000,
+        perTransactionLimitCents: 2000,
+        maxTransactions: 1,
+        expiresAt: futureExpiry(),
+        rail: 'agentcard',
+        createdBy: 'local-operator',
+      }).id,
+      'local-operator',
+    );
+    const request = {
+      task_id: active.taskId!,
+      amount_cents: 1000,
+      merchant: 'Staples',
+      idempotency_key: 'simultaneous-checkout',
+    };
+
+    const results = await Promise.allSettled([
+      service.issueCard(request),
+      service.issueCard(request),
+    ]);
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    const rejected = results.find((result) => result.status === 'rejected');
+    expect(rejected).toMatchObject({
+      status: 'rejected',
+      reason: { code: 'APPROVAL_PENDING' },
+    });
+    expect(await upstream.listCards()).toHaveLength(1);
+    expect(db.repo.getMandate(active.id)).toMatchObject({
+      reservedCents: 1000,
+      transactionCount: 1,
+    });
+  });
+
+  it('can safely retry the same request after rail provisioning fails', async () => {
+    const agent = db.repo.getOrCreateAgent('procurement-agent');
+    const active = db.repo.activateMandate(
+      db.repo.createMandate({
+        agentId: agent.id,
+        purpose: 'Buy paper',
+        merchant: 'Staples',
+        amountLimitCents: 2000,
+        perTransactionLimitCents: 2000,
+        maxTransactions: 1,
+        expiresAt: futureExpiry(),
+        rail: 'agentcard',
+        createdBy: 'local-operator',
+      }).id,
+      'local-operator',
+    );
+    let failOnce = true;
+    const flaky: UpstreamClient = {
+      async createCard(request) {
+        if (failOnce) {
+          failOnce = false;
+          throw new UpstreamError('temporary rail failure');
+        }
+        return upstream.createCard(request);
+      },
+      closeCard: (id) => upstream.closeCard(id),
+      getCardDetails: (id) => upstream.getCardDetails(id),
+      listTransactions: (id, options) => upstream.listTransactions(id, options),
+      listCards: () => upstream.listCards(),
+      checkBalance: (id) => upstream.checkBalance(id),
+    };
+    const retryService = new WardenService({
+      repo: db.repo,
+      upstreams: { agentcard: flaky },
+      mode: 'test',
+      actorAgentName: 'procurement-agent',
+    });
+    const request = {
+      task_id: active.taskId!,
+      amount_cents: 1000,
+      merchant: 'Staples',
+      idempotency_key: 'checkout-retry',
+    };
+
+    await expect(retryService.issueCard(request)).rejects.toMatchObject({
+      code: 'UPSTREAM_ERROR',
+    });
+    expect(db.repo.getMandate(active.id)?.reservedCents).toBe(0);
+
+    const card = await retryService.issueCard(request);
+    expect(card.card_id).toBe('mock_card_1');
+    expect(db.repo.getMandate(active.id)).toMatchObject({
+      reservedCents: 1000,
+      transactionCount: 1,
     });
   });
 });
@@ -268,6 +722,7 @@ describe('multi-rail (SPEC §2.8)', () => {
       repo: db.repo,
       upstreams: { agentcard: upstream, stripe: stripeRail },
       mode: 'test',
+      allowLegacyTasks: true,
     });
     const { task_id } = multiRail.startTask({ agent_name: 'shopper', intent: 'multi-rail run' });
 
@@ -296,6 +751,7 @@ describe('multi-rail (SPEC §2.8)', () => {
       repo: db.repo,
       upstreams: { agentcard: upstream, stripe: stripeRail },
       mode: 'test',
+      allowLegacyTasks: true,
     });
     const { task_id } = multiRail.startTask({ agent_name: 'stripe-shopper', intent: 'x' });
     const card = await multiRail.issueCard({ task_id, amount_cents: 500 });

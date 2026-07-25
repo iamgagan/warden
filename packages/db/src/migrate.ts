@@ -109,6 +109,89 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       ALTER TABLE cards ADD COLUMN rail TEXT NOT NULL DEFAULT 'agentcard';
     `,
   },
+  {
+    id: '0003_mandate_authority',
+    sql: `
+      ALTER TABLE tasks ADD COLUMN mandate_id TEXT;
+      CREATE INDEX tasks_mandate ON tasks (mandate_id);
+
+      CREATE TABLE mandates (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id),
+        task_id TEXT,
+        purpose TEXT NOT NULL,
+        merchant TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('draft','active','exhausted','revoked','expired')),
+        currency TEXT NOT NULL DEFAULT 'USD',
+        amount_limit_cents INTEGER NOT NULL,
+        per_transaction_limit_cents INTEGER NOT NULL,
+        max_transactions INTEGER NOT NULL,
+        transaction_count INTEGER NOT NULL DEFAULT 0,
+        reserved_cents INTEGER NOT NULL DEFAULT 0,
+        settled_cents INTEGER NOT NULL DEFAULT 0,
+        rail TEXT NOT NULL DEFAULT 'auto' CHECK (rail IN ('auto','agentcard','stripe')),
+        policy_id TEXT REFERENCES policies(id),
+        policy_snapshot_hash TEXT,
+        mandate_hash TEXT,
+        created_by TEXT NOT NULL,
+        approved_by TEXT,
+        created_at TEXT NOT NULL,
+        activated_at TEXT,
+        expires_at TEXT NOT NULL,
+        closed_at TEXT,
+        close_reason TEXT
+      );
+      CREATE INDEX mandates_agent ON mandates (agent_id);
+      CREATE INDEX mandates_status ON mandates (status);
+      CREATE INDEX mandates_created ON mandates (created_at);
+
+      CREATE TABLE authorizations (
+        id TEXT PRIMARY KEY,
+        mandate_id TEXT NOT NULL REFERENCES mandates(id),
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        idempotency_key TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        amount_cents INTEGER NOT NULL,
+        merchant TEXT NOT NULL,
+        category TEXT,
+        rail TEXT NOT NULL CHECK (rail IN ('agentcard','stripe')),
+        status TEXT NOT NULL CHECK (status IN ('reserved','card_issued','released','settled')),
+        card_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX authorizations_idempotency_unique ON authorizations (mandate_id, idempotency_key);
+      CREATE UNIQUE INDEX authorizations_card_unique ON authorizations (card_id);
+      CREATE INDEX authorizations_mandate ON authorizations (mandate_id);
+
+      CREATE TABLE evidence (
+        id TEXT PRIMARY KEY,
+        receipt_id TEXT NOT NULL REFERENCES receipts(id),
+        mandate_id TEXT NOT NULL REFERENCES mandates(id),
+        authorization_id TEXT REFERENCES authorizations(id),
+        transaction_id TEXT NOT NULL,
+        event_key TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK (outcome IN ('pending','settled','declined','reversed','refunded','violation')),
+        sequence INTEGER NOT NULL,
+        payload_json TEXT NOT NULL,
+        previous_hash TEXT,
+        evidence_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX evidence_event_unique ON evidence (event_key);
+      CREATE INDEX evidence_receipt ON evidence (receipt_id);
+      CREATE INDEX evidence_transaction ON evidence (transaction_id);
+      CREATE UNIQUE INDEX evidence_hash_unique ON evidence (evidence_hash);
+      CREATE INDEX evidence_mandate ON evidence (mandate_id);
+      CREATE INDEX evidence_created ON evidence (created_at);
+    `,
+  },
+  {
+    id: '0004_authorization_settlement_totals',
+    sql: `
+      ALTER TABLE authorizations ADD COLUMN settled_cents INTEGER NOT NULL DEFAULT 0;
+    `,
+  },
 ];
 
 export function migrate(sqlite: Database): void {

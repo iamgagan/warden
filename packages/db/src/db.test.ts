@@ -4,6 +4,8 @@ import { openWardenDb, type WardenDb } from './client.js';
 import type { TransactionRow } from './schema.js';
 
 let db: WardenDb;
+const futureExpiry = (): string =>
+  new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
 
 beforeEach(() => {
   db = openWardenDb(':memory:');
@@ -58,9 +60,12 @@ describe('migrations', () => {
       'agents',
       'policies',
       'tasks',
+      'mandates',
+      'authorizations',
       'cards',
       'transactions',
       'receipts',
+      'evidence',
       'policy_events',
       'approvals',
     ]) {
@@ -131,6 +136,149 @@ describe('tasks and cards', () => {
   });
 });
 
+describe('mandates and atomic authorizations', () => {
+  it('activates immutable operator authority and creates its task projection', () => {
+    const agent = db.repo.getOrCreateAgent('procurement-agent');
+    const mandate = db.repo.createMandate({
+      agentId: agent.id,
+      purpose: 'Buy printer paper for the New York office',
+      merchant: 'Staples',
+      amountLimitCents: 4000,
+      perTransactionLimitCents: 2500,
+      maxTransactions: 3,
+      expiresAt: futureExpiry(),
+      rail: 'agentcard',
+      createdBy: 'local-operator',
+    });
+
+    expect(mandate.status).toBe('draft');
+    const active = db.repo.activateMandate(mandate.id, 'local-operator');
+    expect(active).toMatchObject({
+      status: 'active',
+      approvedBy: 'local-operator',
+      amountLimitCents: 4000,
+      reservedCents: 0,
+      settledCents: 0,
+      transactionCount: 0,
+    });
+    expect(active.taskId).not.toBeNull();
+    expect(db.repo.getTask(active.taskId!)?.mandateId).toBe(mandate.id);
+    expect(active.mandateHash).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it('reserves cumulative budget atomically and makes retries idempotent', () => {
+    const agent = db.repo.getOrCreateAgent('procurement-agent');
+    const mandate = db.repo.activateMandate(
+      db.repo.createMandate({
+        agentId: agent.id,
+        purpose: 'Buy supplies',
+        merchant: 'Staples',
+        amountLimitCents: 1000,
+        perTransactionLimitCents: 1000,
+        maxTransactions: 2,
+        expiresAt: futureExpiry(),
+        rail: 'agentcard',
+        createdBy: 'local-operator',
+      }).id,
+      'local-operator',
+    );
+
+    const first = db.repo.reserveAuthorization({
+      mandateId: mandate.id,
+      taskId: mandate.taskId!,
+      idempotencyKey: 'checkout-1',
+      requestHash: 'request-a',
+      amountCents: 800,
+      merchant: 'Staples',
+      category: null,
+      rail: 'agentcard',
+    });
+    const retry = db.repo.reserveAuthorization({
+      mandateId: mandate.id,
+      taskId: mandate.taskId!,
+      idempotencyKey: 'checkout-1',
+      requestHash: 'request-a',
+      amountCents: 800,
+      merchant: 'Staples',
+      category: null,
+      rail: 'agentcard',
+    });
+    const overspend = db.repo.reserveAuthorization({
+      mandateId: mandate.id,
+      taskId: mandate.taskId!,
+      idempotencyKey: 'checkout-2',
+      requestHash: 'request-b',
+      amountCents: 800,
+      merchant: 'Staples',
+      category: null,
+      rail: 'agentcard',
+    });
+
+    expect(first.kind).toBe('reserved');
+    expect(retry).toMatchObject({ kind: 'existing' });
+    expect(retry.authorization.id).toBe(first.authorization.id);
+    expect(overspend).toMatchObject({ kind: 'denied', reason: 'budget_unavailable' });
+    expect(db.repo.getMandate(mandate.id)).toMatchObject({
+      reservedCents: 800,
+      transactionCount: 1,
+    });
+    expect(db.repo.getTask(mandate.taskId!)?.spentCents).toBe(800);
+  });
+
+  it('preserves Unicode merchant identity instead of normalizing distinct names to empty', () => {
+    const agent = db.repo.getOrCreateAgent('international-agent');
+    const mandate = db.repo.activateMandate(
+      db.repo.createMandate({
+        agentId: agent.id,
+        purpose: 'Buy supplies in Tokyo',
+        merchant: '東京商店',
+        amountLimitCents: 2000,
+        perTransactionLimitCents: 2000,
+        maxTransactions: 1,
+        expiresAt: futureExpiry(),
+        rail: 'agentcard',
+        createdBy: 'local-operator',
+      }).id,
+      'local-operator',
+    );
+    const result = db.repo.reserveAuthorization({
+      mandateId: mandate.id,
+      taskId: mandate.taskId!,
+      idempotencyKey: 'unicode-merchant',
+      requestHash: 'unicode-request',
+      amountCents: 500,
+      merchant: '恶意商店',
+      category: null,
+      rail: 'agentcard',
+    });
+    expect(result).toMatchObject({ kind: 'denied', reason: 'merchant_not_allowed' });
+  });
+
+  it('expires the linked task when mandate listing discovers elapsed authority', () => {
+    const agent = db.repo.getOrCreateAgent('expiry-agent');
+    const mandate = db.repo.activateMandate(
+      db.repo.createMandate({
+        agentId: agent.id,
+        purpose: 'Buy supplies',
+        merchant: 'Staples',
+        amountLimitCents: 2000,
+        perTransactionLimitCents: 2000,
+        maxTransactions: 1,
+        expiresAt: futureExpiry(),
+        rail: 'agentcard',
+        createdBy: 'local-operator',
+      }).id,
+      'local-operator',
+    );
+    db.sqlite
+      .prepare("UPDATE mandates SET expires_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
+      .run(mandate.id);
+
+    expect(db.repo.listMandates().find((row) => row.id === mandate.id)?.status).toBe('expired');
+    expect(db.repo.getTask(mandate.taskId!)?.status).toBe('expired');
+  });
+});
+
 describe('transactions', () => {
   it('insertTransactionIfNew is idempotent on the upstream id', () => {
     const { card } = seedTaskWithCard();
@@ -188,7 +336,14 @@ describe('receipts', () => {
 
   it('exports no update or delete for receipts (append-only surface)', () => {
     const repoKeys = Object.keys(db.repo).filter((k) => k.toLowerCase().includes('receipt'));
-    expect(repoKeys.sort()).toEqual(['countReceipts', 'getReceipt', 'insertReceipt', 'listReceipts']);
+    expect(repoKeys.sort()).toEqual([
+      'countReceipts',
+      'getEvidenceByReceipt',
+      'getReceipt',
+      'getReceiptByTransaction',
+      'insertReceipt',
+      'listReceipts',
+    ]);
   });
 
   it('paginates with a cursor, newest first', () => {

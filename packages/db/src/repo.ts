@@ -1,10 +1,14 @@
-import { and, desc, eq, isNull, lt, sql } from 'drizzle-orm';
+import { createHash } from 'node:crypto';
+import { and, asc, desc, eq, isNull, lt, sql } from 'drizzle-orm';
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import { nanoid } from 'nanoid';
 import {
   agents,
   approvals,
+  authorizations,
   cards,
+  evidence,
+  mandates,
   policies,
   policyEvents,
   receipts,
@@ -13,8 +17,12 @@ import {
   type AgentRow,
   type ApprovalRow,
   type ApprovalStatus,
+  type AuthorizationRow,
   type CardRow,
   type CardState,
+  type EvidenceRow,
+  type MandateRow,
+  type MandateStatus,
   type PolicyEventRow,
   type PolicyEventType,
   type PolicyRow,
@@ -27,6 +35,37 @@ import {
 export type WardenDrizzle = BetterSQLite3Database;
 
 const now = (): string => new Date().toISOString();
+const sha256 = (value: string): string => createHash('sha256').update(value).digest('hex');
+const normalizeMerchant = (value: string): string =>
+  value
+    .normalize('NFKC')
+    .trim()
+    .toLocaleLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim();
+
+export type AuthorizationReservationResult =
+  | { kind: 'reserved' | 'existing'; authorization: AuthorizationRow }
+  | {
+      kind: 'denied';
+      reason:
+        | 'mandate_not_active'
+        | 'mandate_expired'
+        | 'merchant_not_allowed'
+        | 'rail_not_allowed'
+        | 'amount_exceeds_limit'
+        | 'transaction_limit_reached'
+        | 'budget_unavailable'
+        | 'idempotency_conflict';
+    };
+
+export interface EvidenceListItem extends EvidenceRow {
+  merchant: string;
+  amountCents: number;
+  currency: string;
+  agentName: string;
+  purpose: string;
+}
 
 export interface ReceiptListItem extends ReceiptRow {
   merchant: string;
@@ -70,6 +109,10 @@ export function createRepo(db: WardenDrizzle) {
 
     getAgentByName(name: string): AgentRow | undefined {
       return db.select().from(agents).where(eq(agents.name, name)).get();
+    },
+
+    getAgent(id: string): AgentRow | undefined {
+      return db.select().from(agents).where(eq(agents.id, id)).get();
     },
 
     listAgents(): AgentRow[] {
@@ -129,12 +172,441 @@ export function createRepo(db: WardenDrizzle) {
       return db.select().from(policies).where(eq(policies.id, id)).get();
     },
 
+    // ── mandates (operator-approved source of spend authority) ───────────
+    createMandate(input: {
+      agentId: string;
+      purpose: string;
+      merchant: string;
+      amountLimitCents: number;
+      perTransactionLimitCents: number;
+      maxTransactions: number;
+      expiresAt: string;
+      rail: 'auto' | 'agentcard' | 'stripe';
+      createdBy: string;
+    }): MandateRow {
+      const row: MandateRow = {
+        id: nanoid(),
+        agentId: input.agentId,
+        taskId: null,
+        purpose: input.purpose,
+        merchant: input.merchant.trim(),
+        status: 'draft',
+        currency: 'USD',
+        amountLimitCents: input.amountLimitCents,
+        perTransactionLimitCents: input.perTransactionLimitCents,
+        maxTransactions: input.maxTransactions,
+        transactionCount: 0,
+        reservedCents: 0,
+        settledCents: 0,
+        rail: input.rail,
+        policyId: null,
+        policySnapshotHash: null,
+        mandateHash: null,
+        createdBy: input.createdBy,
+        approvedBy: null,
+        createdAt: now(),
+        activatedAt: null,
+        expiresAt: input.expiresAt,
+        closedAt: null,
+        closeReason: null,
+      };
+      db.insert(mandates).values(row).run();
+      return row;
+    },
+
+    activateMandate(id: string, approvedBy: string): MandateRow {
+      return db.transaction((tx) => {
+        const mandate = tx.select().from(mandates).where(eq(mandates.id, id)).get();
+        if (!mandate) throw new Error(`unknown mandate ${id}`);
+        if (mandate.status === 'active') return mandate;
+        if (mandate.status !== 'draft') {
+          throw new Error(`mandate ${id} is ${mandate.status}`);
+        }
+        const activatedAt = now();
+        if (mandate.expiresAt <= activatedAt) {
+          tx
+            .update(mandates)
+            .set({ status: 'expired', closedAt: activatedAt, closeReason: 'expired before activation' })
+            .where(eq(mandates.id, id))
+            .run();
+          throw new Error(`mandate ${id} is expired`);
+        }
+        const policy = tx
+          .select()
+          .from(policies)
+          .where(and(eq(policies.agentId, mandate.agentId), eq(policies.active, 1)))
+          .get() ??
+          tx
+            .select()
+            .from(policies)
+            .where(and(isNull(policies.agentId), eq(policies.active, 1)))
+            .get();
+        const policySnapshotHash = sha256(policy?.rulesJson ?? '{}');
+        const task: TaskRow = {
+          id: nanoid(),
+          agentId: mandate.agentId,
+          intent: mandate.purpose,
+          status: 'active',
+          budgetCents: mandate.amountLimitCents,
+          spentCents: 0,
+          policyId: policy?.id ?? null,
+          mandateId: mandate.id,
+          createdAt: activatedAt,
+          closedAt: null,
+        };
+        tx.insert(tasks).values(task).run();
+        const mandateHash = sha256(
+          JSON.stringify({
+            id: mandate.id,
+            agentId: mandate.agentId,
+            purpose: mandate.purpose,
+            merchant: normalizeMerchant(mandate.merchant),
+            currency: mandate.currency,
+            amountLimitCents: mandate.amountLimitCents,
+            perTransactionLimitCents: mandate.perTransactionLimitCents,
+            maxTransactions: mandate.maxTransactions,
+            rail: mandate.rail,
+            expiresAt: mandate.expiresAt,
+            policySnapshotHash,
+            approvedBy,
+            activatedAt,
+          }),
+        );
+        tx
+          .update(mandates)
+          .set({
+            taskId: task.id,
+            status: 'active',
+            policyId: policy?.id ?? null,
+            policySnapshotHash,
+            mandateHash,
+            approvedBy,
+            activatedAt,
+          })
+          .where(eq(mandates.id, id))
+          .run();
+        return tx.select().from(mandates).where(eq(mandates.id, id)).get()!;
+      });
+    },
+
+    getMandate(id: string): MandateRow | undefined {
+      const row = db.select().from(mandates).where(eq(mandates.id, id)).get();
+      if (row?.status === 'active' && row.expiresAt <= now()) {
+        db
+          .update(mandates)
+          .set({ status: 'expired', closedAt: now(), closeReason: 'expiry reached' })
+          .where(and(eq(mandates.id, id), eq(mandates.status, 'active')))
+          .run();
+        if (row.taskId) this.setTaskStatus(row.taskId, 'expired');
+        return db.select().from(mandates).where(eq(mandates.id, id)).get();
+      }
+      return row;
+    },
+
+    listMandates(status?: MandateStatus): MandateRow[] {
+      const expiredAt = now();
+      db.transaction((tx) => {
+        const due = tx
+          .select({ id: mandates.id, taskId: mandates.taskId })
+          .from(mandates)
+          .where(and(eq(mandates.status, 'active'), sql`${mandates.expiresAt} <= ${expiredAt}`))
+          .all();
+        for (const mandate of due) {
+          tx
+            .update(mandates)
+            .set({ status: 'expired', closedAt: expiredAt, closeReason: 'expiry reached' })
+            .where(eq(mandates.id, mandate.id))
+            .run();
+          if (mandate.taskId) {
+            tx
+              .update(tasks)
+              .set({ status: 'expired', closedAt: expiredAt })
+              .where(eq(tasks.id, mandate.taskId))
+              .run();
+          }
+        }
+      });
+      return db
+        .select()
+        .from(mandates)
+        .where(status ? eq(mandates.status, status) : undefined)
+        .orderBy(desc(mandates.createdAt), desc(mandates.id))
+        .all();
+    },
+
+    revokeMandate(id: string, reason: string, revokedBy: string): MandateRow {
+      return db.transaction((tx) => {
+        const mandate = tx.select().from(mandates).where(eq(mandates.id, id)).get();
+        if (!mandate) throw new Error(`unknown mandate ${id}`);
+        if (!['draft', 'active'].includes(mandate.status)) {
+          throw new Error(`mandate ${id} is ${mandate.status}`);
+        }
+        const closedAt = now();
+        tx
+          .update(mandates)
+          .set({
+            status: 'revoked',
+            closedAt,
+            closeReason: `${reason.trim()} — ${revokedBy}`,
+          })
+          .where(eq(mandates.id, id))
+          .run();
+        if (mandate.taskId) {
+          tx
+            .update(tasks)
+            .set({ status: 'halted', closedAt })
+            .where(eq(tasks.id, mandate.taskId))
+            .run();
+        }
+        return tx.select().from(mandates).where(eq(mandates.id, id)).get()!;
+      });
+    },
+
+    reserveAuthorization(input: {
+      mandateId: string;
+      taskId: string;
+      idempotencyKey: string;
+      requestHash: string;
+      amountCents: number;
+      merchant: string;
+      category: string | null;
+      rail: 'agentcard' | 'stripe';
+    }): AuthorizationReservationResult {
+      return db.transaction((tx): AuthorizationReservationResult => {
+        const existing = tx
+          .select()
+          .from(authorizations)
+          .where(
+            and(
+              eq(authorizations.mandateId, input.mandateId),
+              eq(authorizations.idempotencyKey, input.idempotencyKey),
+            ),
+          )
+          .get();
+        if (existing) {
+          if (existing.requestHash !== input.requestHash) {
+            return { kind: 'denied', reason: 'idempotency_conflict' };
+          }
+          if (existing.status === 'released' && existing.cardId === null) {
+            // Provisioning failed before any rail artifact existed. Reusing the
+            // same key is a safe retry: remove the inert reservation record and
+            // re-run every current mandate check below.
+            tx.delete(authorizations).where(eq(authorizations.id, existing.id)).run();
+          } else {
+            return { kind: 'existing', authorization: existing };
+          }
+        }
+
+        const mandate = tx.select().from(mandates).where(eq(mandates.id, input.mandateId)).get();
+        if (!mandate || mandate.taskId !== input.taskId) {
+          return { kind: 'denied', reason: 'mandate_not_active' };
+        }
+        const timestamp = now();
+        if (mandate.expiresAt <= timestamp) {
+          tx
+            .update(mandates)
+            .set({ status: 'expired', closedAt: timestamp, closeReason: 'expiry reached' })
+            .where(eq(mandates.id, mandate.id))
+            .run();
+          tx
+            .update(tasks)
+            .set({ status: 'expired', closedAt: timestamp })
+            .where(eq(tasks.id, input.taskId))
+            .run();
+          return { kind: 'denied', reason: 'mandate_expired' };
+        }
+        if (mandate.status !== 'active') {
+          return { kind: 'denied', reason: 'mandate_not_active' };
+        }
+        if (normalizeMerchant(mandate.merchant) !== normalizeMerchant(input.merchant)) {
+          return { kind: 'denied', reason: 'merchant_not_allowed' };
+        }
+        if (mandate.rail !== 'auto' && mandate.rail !== input.rail) {
+          return { kind: 'denied', reason: 'rail_not_allowed' };
+        }
+        if (input.amountCents > mandate.perTransactionLimitCents) {
+          return { kind: 'denied', reason: 'amount_exceeds_limit' };
+        }
+        if (mandate.transactionCount >= mandate.maxTransactions) {
+          return { kind: 'denied', reason: 'transaction_limit_reached' };
+        }
+
+        const taskReservation = tx
+          .update(tasks)
+          .set({ spentCents: sql`${tasks.spentCents} + ${input.amountCents}` })
+          .where(
+            and(
+              eq(tasks.id, input.taskId),
+              eq(tasks.status, 'active'),
+              sql`${tasks.spentCents} + ${input.amountCents} <= ${tasks.budgetCents}`,
+            ),
+          )
+          .run();
+        if (taskReservation.changes === 0) {
+          return { kind: 'denied', reason: 'budget_unavailable' };
+        }
+
+        const mandateReservation = tx
+          .update(mandates)
+          .set({
+            reservedCents: sql`${mandates.reservedCents} + ${input.amountCents}`,
+            transactionCount: sql`${mandates.transactionCount} + 1`,
+          })
+          .where(
+            and(
+              eq(mandates.id, input.mandateId),
+              eq(mandates.status, 'active'),
+              sql`${mandates.reservedCents} + ${mandates.settledCents} + ${input.amountCents} <= ${mandates.amountLimitCents}`,
+              sql`${mandates.transactionCount} < ${mandates.maxTransactions}`,
+            ),
+          )
+          .run();
+        if (mandateReservation.changes === 0) {
+          return { kind: 'denied', reason: 'budget_unavailable' };
+        }
+
+        const authorization: AuthorizationRow = {
+          id: nanoid(),
+          mandateId: input.mandateId,
+          taskId: input.taskId,
+          idempotencyKey: input.idempotencyKey,
+          requestHash: input.requestHash,
+          amountCents: input.amountCents,
+          merchant: input.merchant.trim(),
+          category: input.category,
+          rail: input.rail,
+          status: 'reserved',
+          settledCents: 0,
+          cardId: null,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        };
+        tx.insert(authorizations).values(authorization).run();
+        return { kind: 'reserved', authorization };
+      });
+    },
+
+    bindAuthorizationCard(id: string, cardId: string): void {
+      db
+        .update(authorizations)
+        .set({ cardId, status: 'card_issued', updatedAt: now() })
+        .where(and(eq(authorizations.id, id), eq(authorizations.status, 'reserved')))
+        .run();
+    },
+
+    getAuthorizationByCard(cardId: string): AuthorizationRow | undefined {
+      return db.select().from(authorizations).where(eq(authorizations.cardId, cardId)).get();
+    },
+
+    getAuthorizationByIdempotency(
+      mandateId: string,
+      idempotencyKey: string,
+    ): AuthorizationRow | undefined {
+      return db
+        .select()
+        .from(authorizations)
+        .where(
+          and(
+            eq(authorizations.mandateId, mandateId),
+            eq(authorizations.idempotencyKey, idempotencyKey),
+          ),
+        )
+        .get();
+    },
+
+    releaseAuthorization(id: string): boolean {
+      return db.transaction((tx) => {
+        const authorization = tx.select().from(authorizations).where(eq(authorizations.id, id)).get();
+        if (!authorization || !['reserved', 'card_issued'].includes(authorization.status)) return false;
+        tx
+          .update(authorizations)
+          .set({ status: 'released', updatedAt: now() })
+          .where(eq(authorizations.id, id))
+          .run();
+        tx
+          .update(mandates)
+          .set({
+            reservedCents: sql`max(0, ${mandates.reservedCents} - ${authorization.amountCents})`,
+            transactionCount: sql`max(0, ${mandates.transactionCount} - 1)`,
+          })
+          .where(eq(mandates.id, authorization.mandateId))
+          .run();
+        tx
+          .update(tasks)
+          .set({ spentCents: sql`max(0, ${tasks.spentCents} - ${authorization.amountCents})` })
+          .where(eq(tasks.id, authorization.taskId))
+          .run();
+        return true;
+      });
+    },
+
+    /**
+     * Idempotently true an authorization up to the card-wide cumulative
+     * settled total. A rail can capture more than once before cancellation,
+     * and multiple reconcilers can observe the same total concurrently.
+     */
+    settleAuthorization(id: string, settledCents: number): boolean {
+      return db.transaction((tx) => {
+        const authorization = tx.select().from(authorizations).where(eq(authorizations.id, id)).get();
+        if (
+          !authorization ||
+          !['reserved', 'card_issued', 'settled'].includes(authorization.status) ||
+          settledCents <= authorization.settledCents
+        ) {
+          return false;
+        }
+        const firstSettlement = authorization.status !== 'settled';
+        const delta = settledCents - authorization.settledCents;
+        tx
+          .update(authorizations)
+          .set({ status: 'settled', settledCents, updatedAt: now() })
+          .where(eq(authorizations.id, id))
+          .run();
+        tx
+          .update(tasks)
+          .set({
+            spentCents: firstSettlement
+              ? sql`${tasks.spentCents} + ${settledCents - authorization.amountCents}`
+              : sql`${tasks.spentCents} + ${delta}`,
+          })
+          .where(eq(tasks.id, authorization.taskId))
+          .run();
+        tx
+          .update(mandates)
+          .set({
+            reservedCents: firstSettlement
+              ? sql`max(0, ${mandates.reservedCents} - ${authorization.amountCents})`
+              : mandates.reservedCents,
+            settledCents: sql`${mandates.settledCents} + ${delta}`,
+          })
+          .where(eq(mandates.id, authorization.mandateId))
+          .run();
+        const mandate = tx
+          .select()
+          .from(mandates)
+          .where(eq(mandates.id, authorization.mandateId))
+          .get()!;
+        if (
+          mandate.settledCents + mandate.reservedCents >= mandate.amountLimitCents ||
+          mandate.transactionCount >= mandate.maxTransactions
+        ) {
+          tx
+            .update(mandates)
+            .set({ status: 'exhausted', closedAt: now(), closeReason: 'authority consumed' })
+            .where(and(eq(mandates.id, mandate.id), eq(mandates.status, 'active')))
+            .run();
+        }
+        return true;
+      });
+    },
+
     // ── tasks ─────────────────────────────────────────────────────────────
     createTask(input: {
       agentId: string;
       intent: string;
       budgetCents: number;
       policyId: string | null;
+      mandateId?: string | null;
     }): TaskRow {
       const row: TaskRow = {
         id: nanoid(),
@@ -144,6 +616,7 @@ export function createRepo(db: WardenDrizzle) {
         budgetCents: input.budgetCents,
         spentCents: 0,
         policyId: input.policyId,
+        mandateId: input.mandateId ?? null,
         createdAt: now(),
         closedAt: null,
       };
@@ -165,6 +638,21 @@ export function createRepo(db: WardenDrizzle) {
         .set({ spentCents: sql`${tasks.spentCents} + ${cents}` })
         .where(eq(tasks.id, id))
         .run();
+    },
+
+    tryReserveTaskSpend(id: string, cents: number): boolean {
+      const result = db
+        .update(tasks)
+        .set({ spentCents: sql`${tasks.spentCents} + ${cents}` })
+        .where(
+          and(
+            eq(tasks.id, id),
+            eq(tasks.status, 'active'),
+            sql`${tasks.spentCents} + ${cents} <= ${tasks.budgetCents}`,
+          ),
+        )
+        .run();
+      return result.changes > 0;
     },
 
     listTasksByAgent(agentId: string): TaskRow[] {
@@ -288,6 +776,14 @@ export function createRepo(db: WardenDrizzle) {
       return row;
     },
 
+    getReceiptByTransaction(transactionId: string): ReceiptRow | undefined {
+      return db
+        .select()
+        .from(receipts)
+        .where(eq(receipts.transactionId, transactionId))
+        .get();
+    },
+
     getReceipt(id: string): ReceiptListItem | undefined {
       return this.listReceipts({ receiptId: id, limit: 1 })[0];
     },
@@ -340,6 +836,145 @@ export function createRepo(db: WardenDrizzle) {
     countReceipts(): number {
       const row = db.select({ n: sql<number>`count(*)` }).from(receipts).get();
       return row?.n ?? 0;
+    },
+
+    // ── evidence (APPEND-ONLY hash-linked receipt projections) ───────────
+    insertEvidence(input: {
+      receiptId: string;
+      mandateId: string;
+      authorizationId: string | null;
+      transactionId: string;
+      eventKey: string;
+      outcome: EvidenceRow['outcome'];
+      payload: Record<string, unknown>;
+    }): EvidenceRow {
+      return db.transaction((tx) => {
+        const existing = tx.select().from(evidence).where(eq(evidence.eventKey, input.eventKey)).get();
+        if (existing) return existing;
+        const latest = tx.select().from(evidence).orderBy(desc(evidence.sequence)).limit(1).get();
+        const sequence = (latest?.sequence ?? 0) + 1;
+        const previousHash = latest?.evidenceHash ?? null;
+        const id = nanoid();
+        const createdAt = now();
+        const payloadJson = JSON.stringify(input.payload);
+        const evidenceHash = sha256(
+          JSON.stringify({
+            sequence,
+            previousHash,
+            record: {
+              id,
+              receiptId: input.receiptId,
+              mandateId: input.mandateId,
+              authorizationId: input.authorizationId,
+              transactionId: input.transactionId,
+              eventKey: input.eventKey,
+              outcome: input.outcome,
+              createdAt,
+              payload: input.payload,
+            },
+          }),
+        );
+        const row: EvidenceRow = {
+          id,
+          receiptId: input.receiptId,
+          mandateId: input.mandateId,
+          authorizationId: input.authorizationId,
+          transactionId: input.transactionId,
+          eventKey: input.eventKey,
+          outcome: input.outcome,
+          sequence,
+          payloadJson,
+          previousHash,
+          evidenceHash,
+          createdAt,
+        };
+        tx.insert(evidence).values(row).run();
+        return row;
+      });
+    },
+
+    getEvidenceByReceipt(receiptId: string): EvidenceRow | undefined {
+      return db
+        .select()
+        .from(evidence)
+        .where(eq(evidence.receiptId, receiptId))
+        .orderBy(desc(evidence.sequence))
+        .limit(1)
+        .get();
+    },
+
+    verifyEvidenceChain(): {
+      valid: boolean;
+      checkedRecords: number;
+      firstInvalidSequence: number | null;
+    } {
+      const rows = db.select().from(evidence).orderBy(asc(evidence.sequence)).all();
+      let previousHash: string | null = null;
+      let expectedSequence = 1;
+      for (const row of rows) {
+        try {
+          const payload = JSON.parse(row.payloadJson) as unknown;
+          const expectedHash = sha256(
+            JSON.stringify({
+              sequence: row.sequence,
+              previousHash: row.previousHash,
+              record: {
+                id: row.id,
+                receiptId: row.receiptId,
+                mandateId: row.mandateId,
+                authorizationId: row.authorizationId,
+                transactionId: row.transactionId,
+                eventKey: row.eventKey,
+                outcome: row.outcome,
+                createdAt: row.createdAt,
+                payload,
+              },
+            }),
+          );
+          if (
+            row.sequence !== expectedSequence ||
+            row.previousHash !== previousHash ||
+            row.evidenceHash !== expectedHash
+          ) {
+            return {
+              valid: false,
+              checkedRecords: expectedSequence - 1,
+              firstInvalidSequence: row.sequence,
+            };
+          }
+        } catch {
+          return {
+            valid: false,
+            checkedRecords: expectedSequence - 1,
+            firstInvalidSequence: row.sequence,
+          };
+        }
+        previousHash = row.evidenceHash;
+        expectedSequence += 1;
+      }
+      return { valid: true, checkedRecords: rows.length, firstInvalidSequence: null };
+    },
+
+    listEvidence(filter: { mandateId?: string; limit: number }): EvidenceListItem[] {
+      return db
+        .select({
+          evidence,
+          merchant: transactions.merchant,
+          amountCents: transactions.amountCents,
+          currency: transactions.currency,
+          agentName: agents.name,
+          purpose: mandates.purpose,
+        })
+        .from(evidence)
+        .innerJoin(receipts, eq(evidence.receiptId, receipts.id))
+        .innerJoin(transactions, eq(evidence.transactionId, transactions.id))
+        .innerJoin(mandates, eq(evidence.mandateId, mandates.id))
+        .innerJoin(agents, eq(mandates.agentId, agents.id))
+        .where(filter.mandateId ? eq(evidence.mandateId, filter.mandateId) : undefined)
+        .orderBy(desc(evidence.sequence))
+        .limit(filter.limit)
+        .all()
+        .map((row) => ({ ...row.evidence, ...row, evidence: undefined }) as unknown as EvidenceListItem);
     },
 
     // ── policy events (APPEND-ONLY) ───────────────────────────────────────

@@ -1,16 +1,21 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
 import {
   api,
   dollars,
   UnauthorizedError,
   type AgentSummary,
+  type CreateMandateInput,
+  type Evidence,
   type Health,
+  type Mandate,
   type PolicyRules,
   type PolicyVersion,
   type Receipt,
-  type ReceiptDetail,
   type Stats,
 } from './api.js';
+
+const TOKEN_KEY = 'warden_api_token';
+const POLL_MS = 5000;
 
 const DEFAULT_RULES: PolicyRules = {
   allowed_merchants: [],
@@ -25,10 +30,21 @@ const DEFAULT_RULES: PolicyRules = {
   default_rail: 'agentcard',
 };
 
-const TOKEN_KEY = 'warden_api_token';
-const POLL_MS = 5000;
+type View = 'overview' | 'mandates' | 'evidence' | 'policy';
+type IconName =
+  | 'overview'
+  | 'mandate'
+  | 'evidence'
+  | 'policy'
+  | 'plus'
+  | 'shield'
+  | 'arrow'
+  | 'close'
+  | 'check'
+  | 'clock'
+  | 'merchant'
+  | 'agent';
 
-/** One-time token handoff for demos: /#token=... is stored and stripped. */
 function tokenFromHash(): string | null {
   const match = /[#&]token=([^&]+)/.exec(window.location.hash);
   if (!match) return null;
@@ -45,15 +61,15 @@ export function App() {
   if (!token) {
     return (
       <TokenGate
-        onSubmit={(t) => {
-          localStorage.setItem(TOKEN_KEY, t);
-          setToken(t);
+        onSubmit={(nextToken) => {
+          localStorage.setItem(TOKEN_KEY, nextToken);
+          setToken(nextToken);
         }}
       />
     );
   }
   return (
-    <Dashboard
+    <ControlPlane
       token={token}
       onUnauthorized={() => {
         localStorage.removeItem(TOKEN_KEY);
@@ -66,498 +82,1579 @@ export function App() {
 function TokenGate({ onSubmit }: { onSubmit: (token: string) => void }) {
   const [value, setValue] = useState('');
   return (
-    <main className="gate">
-      <h1>Warden</h1>
-      <p>Enter the API token (WARDEN_API_TOKEN) to open the receipts dashboard.</p>
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          if (value.trim()) onSubmit(value.trim());
-        }}
-      >
-        <input
-          autoFocus
-          type="password"
-          placeholder="API token"
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-        />
-        <button type="submit">Open dashboard</button>
-      </form>
+    <main className="gate-shell">
+      <section className="gate-card">
+        <Logo />
+        <div className="gate-copy">
+          <span className="eyebrow">Operator access</span>
+          <h1>Your control plane for agent spend.</h1>
+          <p>Enter the local API token to review authority, outcomes, and evidence.</p>
+        </div>
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (value.trim()) onSubmit(value.trim());
+          }}
+        >
+          <label htmlFor="api-token">API token</label>
+          <div className="gate-input-row">
+            <input
+              id="api-token"
+              autoFocus
+              type="password"
+              autoComplete="current-password"
+              placeholder="Paste your Warden token"
+              value={value}
+              onChange={(event) => setValue(event.target.value)}
+            />
+            <button type="submit" className="primary-button">
+              Continue <Icon name="arrow" />
+            </button>
+          </div>
+        </form>
+        <p className="gate-footnote">The token stays in this browser.</p>
+      </section>
+      <div className="gate-aside" aria-hidden="true">
+        <div className="gate-orbit orbit-one" />
+        <div className="gate-orbit orbit-two" />
+        <div className="gate-proof">
+          <Icon name="shield" />
+          <span>Authority before execution</span>
+          <strong>Evidence after settlement</strong>
+        </div>
+      </div>
     </main>
   );
 }
 
-function Dashboard({ token, onUnauthorized }: { token: string; onUnauthorized: () => void }) {
-  const [view, setView] = useState<'receipts' | 'policy'>('receipts');
+function ControlPlane({
+  token,
+  onUnauthorized,
+}: {
+  token: string;
+  onUnauthorized: () => void;
+}) {
+  const [view, setView] = useState<View>('overview');
   const [health, setHealth] = useState<Health | null>(null);
   const [stats, setStats] = useState<Stats | null>(null);
+  const [mandates, setMandates] = useState<Mandate[]>([]);
+  const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [receipts, setReceipts] = useState<Receipt[]>([]);
-  const [selected, setSelected] = useState<ReceiptDetail | null>(null);
+  const [selectedEvidence, setSelectedEvidence] = useState<Evidence | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const [h, s, r] = await Promise.all([api.health(), api.stats(token), api.receipts(token)]);
-      setHealth(h);
-      setStats(s);
-      setReceipts(r.receipts);
+      const [nextHealth, nextStats, nextMandates, nextEvidence, nextReceipts] =
+        await Promise.all([
+          api.health(),
+          api.stats(token),
+          api.mandates(token),
+          api.evidence(token),
+          api.receipts(token),
+        ]);
+      setHealth(nextHealth);
+      setStats(nextStats);
+      setMandates(nextMandates.mandates);
+      setEvidence(nextEvidence.evidence);
+      setReceipts(nextReceipts.receipts);
       setError(null);
-    } catch (err) {
-      if (err instanceof UnauthorizedError) onUnauthorized();
-      else setError(err instanceof Error ? err.message : String(err));
+    } catch (nextError) {
+      if (nextError instanceof UnauthorizedError) onUnauthorized();
+      else setError(nextError instanceof Error ? nextError.message : String(nextError));
+    } finally {
+      setLoading(false);
     }
   }, [token, onUnauthorized]);
 
   useEffect(() => {
     void refresh();
-    const timer = setInterval(() => void refresh(), POLL_MS);
-    return () => clearInterval(timer);
+    const timer = window.setInterval(() => void refresh(), POLL_MS);
+    return () => window.clearInterval(timer);
   }, [refresh]);
 
-  const openReceipt = async (id: string) => {
-    try {
-      setSelected(await api.receipt(token, id));
-    } catch (err) {
-      if (err instanceof UnauthorizedError) onUnauthorized();
-    }
-  };
+  const title = {
+    overview: 'Overview',
+    mandates: 'Spend mandates',
+    evidence: 'Integrity evidence',
+    policy: 'Policy',
+  }[view];
 
   return (
-    <div className="layout">
-      <header>
-        <div className="brand">
-          <h1>Warden</h1>
-          <span className="tagline">every dollar, with the why</span>
+    <div className="app-shell">
+      <aside className="sidebar">
+        <Logo />
+        <nav className="primary-nav" aria-label="Primary">
+          <NavButton
+            label="Overview"
+            icon="overview"
+            active={view === 'overview'}
+            onClick={() => setView('overview')}
+          />
+          <NavButton
+            label="Mandates"
+            icon="mandate"
+            active={view === 'mandates'}
+            onClick={() => setView('mandates')}
+          />
+          <NavButton
+            label="Evidence"
+            icon="evidence"
+            active={view === 'evidence'}
+            onClick={() => setView('evidence')}
+          />
+          <NavButton
+            label="Policy"
+            icon="policy"
+            active={view === 'policy'}
+            onClick={() => setView('policy')}
+          />
+        </nav>
+        <div className="sidebar-foot">
+          <div className="system-state">
+            <span className={`live-dot ${health?.ok ? 'online' : ''}`} />
+            <div>
+              <strong>{health?.ok ? 'Warden online' : 'Connecting'}</strong>
+              <span>{health?.mode ?? 'test'} environment</span>
+            </div>
+          </div>
+          <button className="text-button" onClick={onUnauthorized}>
+            Lock console
+          </button>
         </div>
-        <div className="badges">
-          {health && <span className={`badge mode-${health.mode}`}>{health.mode} mode</span>}
-          {health?.upstream_auth === 'needs_login' && (
-            <span className="badge warn">
-              upstream auth needed — run <code>warden auth</code>
-            </span>
-          )}
-        </div>
-      </header>
+      </aside>
 
-      {stats && (
-        <section className="stats">
-          <Stat label="Receipts" value={String(stats.receipts_total)} />
-          <Stat label="Off-policy blocks" value={String(stats.blocks_total)} />
-          <Stat label="Spend under management" value={dollars(stats.spend_under_management_cents)} />
-          <Stat label="Avg blast radius" value={dollars(stats.avg_blast_radius_cents)} />
-        </section>
+      <main className="workspace">
+        <header className="workspace-header">
+          <div>
+            <span className="eyebrow">Operator control plane</span>
+            <h1>{title}</h1>
+          </div>
+          <div className="header-actions">
+            {health?.upstream_auth === 'needs_login' && (
+              <span className="alert-chip">Rail connection needs attention</span>
+            )}
+            <button
+              className="primary-button"
+              onClick={() => setCreating(true)}
+              data-testid="new-mandate"
+            >
+              <Icon name="plus" /> New mandate
+            </button>
+          </div>
+        </header>
+
+        {error && (
+          <div className="error-banner" role="alert">
+            <strong>Warden could not refresh.</strong>
+            <span>{error}</span>
+            <button onClick={() => void refresh()}>Try again</button>
+          </div>
+        )}
+
+        {loading ? (
+          <LoadingState />
+        ) : (
+          <>
+            {view === 'overview' && (
+              <Overview
+                stats={stats}
+                mandates={mandates}
+                evidence={evidence}
+                onNewMandate={() => setCreating(true)}
+                onOpenMandates={() => setView('mandates')}
+                onOpenEvidence={(item) => {
+                  setSelectedEvidence(item);
+                  setView('evidence');
+                }}
+              />
+            )}
+            {view === 'mandates' && (
+              <MandatesView
+                token={token}
+                mandates={mandates}
+                onNewMandate={() => setCreating(true)}
+                onRefresh={refresh}
+              />
+            )}
+            {view === 'evidence' && (
+              <EvidenceView
+                evidence={evidence}
+                receipts={receipts}
+                onSelect={setSelectedEvidence}
+              />
+            )}
+            {view === 'policy' && (
+              <PolicyEditor token={token} onUnauthorized={onUnauthorized} />
+            )}
+          </>
+        )}
+      </main>
+
+      {creating && (
+        <MandateComposer
+          token={token}
+          onClose={() => setCreating(false)}
+          onCreated={async () => {
+            setCreating(false);
+            setView('mandates');
+            await refresh();
+          }}
+        />
       )}
-
-      {error && <p className="error">API error: {error}</p>}
-
-      <nav className="tabs">
-        <button className={view === 'receipts' ? 'active' : ''} onClick={() => setView('receipts')}>
-          Receipts
-        </button>
-        <button className={view === 'policy' ? 'active' : ''} onClick={() => setView('policy')}>
-          Policy
-        </button>
-      </nav>
-
-      {view === 'receipts' ? (
-        <section className="panel">
-          <h2>Receipts</h2>
-          {receipts.length === 0 ? (
-            <p className="empty">
-              No receipts yet. Point your agent at warden-mcp, start a task, and every charge will
-              land here bound to its intent.
-            </p>
-          ) : (
-            <table>
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>Agent</th>
-                  <th>Merchant</th>
-                  <th className="num">Amount</th>
-                  <th>Intent</th>
-                  <th>Card</th>
-                  <th>Rail</th>
-                </tr>
-              </thead>
-              <tbody>
-                {receipts.map((r) => (
-                  <tr key={r.id} onClick={() => void openReceipt(r.id)}>
-                    <td className="mono">{new Date(r.occurred_at).toLocaleString()}</td>
-                    <td>{r.agent}</td>
-                    <td>{r.merchant}</td>
-                    <td className="num">{dollars(r.amount_cents)}</td>
-                    <td className="intent">{r.intent}</td>
-                    <td className="mono">{r.card_id}</td>
-                    <td>
-                      <RailBadge rail={r.rail} />
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </section>
-      ) : (
-        <PolicyEditor token={token} onUnauthorized={onUnauthorized} />
+      {selectedEvidence && (
+        <EvidenceDrawer
+          evidence={selectedEvidence}
+          onClose={() => setSelectedEvidence(null)}
+        />
       )}
-
-      {selected && <Drawer receipt={selected} onClose={() => setSelected(null)} />}
     </div>
   );
 }
 
-function PolicyEditor({ token, onUnauthorized }: { token: string; onUnauthorized: () => void }) {
+function Overview({
+  stats,
+  mandates,
+  evidence,
+  onNewMandate,
+  onOpenMandates,
+  onOpenEvidence,
+}: {
+  stats: Stats | null;
+  mandates: Mandate[];
+  evidence: Evidence[];
+  onNewMandate: () => void;
+  onOpenMandates: () => void;
+  onOpenEvidence: (evidence: Evidence) => void;
+}) {
+  const active = mandates.filter((mandate) => mandate.status === 'active');
+  const featured = active[0];
+
+  return (
+    <div className="view-stack enter">
+      <section className="hero-panel">
+        <div className="hero-copy">
+          <span className="eyebrow accent">Authority layer for agent commerce</span>
+          <h2>Every agent dollar starts with your decision.</h2>
+          <p>
+            Define the purpose, payee, ceiling, and expiry. Warden turns that intent into
+            bounded execution and settlement evidence.
+          </p>
+          <div className="hero-actions">
+            <button className="primary-button" onClick={onNewMandate}>
+              Create authority <Icon name="arrow" />
+            </button>
+            <button className="secondary-button" onClick={onOpenMandates}>
+              Review mandates
+            </button>
+          </div>
+        </div>
+        <div className="authority-diagram" aria-label="Authority lifecycle">
+          <div className="authority-line" />
+          <LifecycleNode step="01" title="Approve" detail="Operator mandate" active />
+          <LifecycleNode step="02" title="Authorize" detail="Atomic reservation" active={active.length > 0} />
+          <LifecycleNode step="03" title="Prove" detail="Integrity evidence" active={evidence.length > 0} />
+        </div>
+      </section>
+
+      <section className="metric-strip" aria-label="Key metrics">
+        <Metric label="Active mandates" value={String(stats?.active_mandates ?? 0)} />
+        <Metric
+          label="Authority available"
+          value={dollars(stats?.authority_available_cents ?? 0)}
+        />
+        <Metric label="Evidence records" value={String(stats?.evidence_total ?? 0)} />
+        <Metric label="Prevented attempts" value={String(stats?.blocks_total ?? 0)} />
+      </section>
+
+      <div className="overview-grid">
+        <section className="surface featured-authority">
+          <SectionHeader
+            eyebrow="Live authority"
+            title={featured ? featured.merchant : 'No active mandate'}
+            action={
+              <button className="text-link" onClick={featured ? onOpenMandates : onNewMandate}>
+                {featured ? 'View all' : 'Create one'} <Icon name="arrow" />
+              </button>
+            }
+          />
+          {featured ? (
+            <MandateSpotlight mandate={featured} />
+          ) : (
+            <EmptyState
+              icon="mandate"
+              title="Create your first spend mandate"
+              body="Give an agent bounded authority before it enters a checkout."
+              action="Create mandate"
+              onAction={onNewMandate}
+            />
+          )}
+        </section>
+
+        <section className="surface evidence-feed">
+          <SectionHeader
+            eyebrow="Recent outcomes"
+            title="Evidence ledger"
+            meta={evidence.length ? `${evidence.length} sealed` : undefined}
+          />
+          {evidence.length ? (
+            <div className="timeline-list">
+              {evidence.slice(0, 5).map((item) => (
+                <button
+                  key={item.id}
+                  className="timeline-item"
+                  onClick={() => onOpenEvidence(item)}
+                >
+                  <span className={`outcome-mark outcome-${item.outcome}`}>
+                    <Icon name={item.decision === 'matched' ? 'check' : 'close'} />
+                  </span>
+                  <span className="timeline-copy">
+                    <strong>
+                      {dollars(item.amount_cents)} at {item.merchant}
+                    </strong>
+                    <span>{item.purpose}</span>
+                  </span>
+                  <span className="timeline-time">{relativeTime(item.created_at)}</span>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <EmptyState
+              icon="evidence"
+              title="Evidence appears after settlement"
+              body="Each verified outcome will be linked back to the exact authority that allowed it."
+            />
+          )}
+        </section>
+
+        <section className="surface assurance-panel">
+          <SectionHeader eyebrow="Assurance" title="What Warden enforces" />
+          <div className="assurance-list">
+            <AssuranceRow label="Authority budget" detail="Atomic, cumulative" />
+            <AssuranceRow label="Agent retry safety" detail="Idempotent" />
+            <AssuranceRow label="Payee verification" detail="Checked at settlement" />
+            <AssuranceRow label="Evidence integrity" detail="SHA-256 hash chain" />
+          </div>
+          <p className="assurance-note">
+            Merchant settlement is verified against the mandate. Network-level merchant
+            binding depends on rail capability.
+          </p>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function MandatesView({
+  token,
+  mandates,
+  onNewMandate,
+  onRefresh,
+}: {
+  token: string;
+  mandates: Mandate[];
+  onNewMandate: () => void;
+  onRefresh: () => Promise<void>;
+}) {
+  const [busy, setBusy] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [revoking, setRevoking] = useState<Mandate | null>(null);
+
+  const activate = async (mandate: Mandate) => {
+    setBusy(mandate.id);
+    setActionError(null);
+    try {
+      await api.activateMandate(token, mandate.id);
+      await onRefresh();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div className="view-stack enter">
+      <section className="view-intro">
+        <div>
+          <span className="eyebrow accent">Authority registry</span>
+          <h2>Bounded permission, made explicit.</h2>
+          <p>
+            Active terms are immutable. To change the payee, purpose, amount, or expiry,
+            revoke the authority and issue a new mandate.
+          </p>
+        </div>
+        <div className="registry-count">
+          <strong>{mandates.length}</strong>
+          <span>Total records</span>
+        </div>
+      </section>
+
+      {actionError && <div className="inline-error">{actionError}</div>}
+
+      {mandates.length ? (
+        <section className="mandate-registry">
+          <div className="registry-head">
+            <span>Authority</span>
+            <span>Usage</span>
+            <span>State</span>
+            <span className="visually-hidden">Actions</span>
+          </div>
+          {mandates.map((mandate) => {
+            const consumed = mandate.reserved_cents + mandate.settled_cents;
+            const percent = Math.min(100, (consumed / mandate.amount_limit_cents) * 100);
+            return (
+              <article className="mandate-row" key={mandate.id} data-testid="mandate-row">
+                <div className="mandate-identity">
+                  <span className="merchant-monogram">{mandate.merchant.slice(0, 1).toUpperCase()}</span>
+                  <div>
+                    <strong>{mandate.merchant}</strong>
+                    <span>{mandate.purpose}</span>
+                    <small>
+                      <Icon name="agent" /> {mandate.agent}
+                      <span className="dot-separator" />
+                      <Icon name="clock" /> Expires {formatDate(mandate.expires_at)}
+                    </small>
+                  </div>
+                </div>
+                <div className="usage-cell">
+                  <div className="usage-line">
+                    <strong>{dollars(consumed)}</strong>
+                    <span>of {dollars(mandate.amount_limit_cents)}</span>
+                  </div>
+                  <div className="progress-track">
+                    <span style={{ width: `${percent}%` }} />
+                  </div>
+                  <small>
+                    {mandate.transaction_count} of {mandate.max_transactions} uses
+                  </small>
+                </div>
+                <div className="status-cell">
+                  <StatusPill status={mandate.status} />
+                  <span>{mandate.rail === 'auto' ? 'Any configured rail' : mandate.rail}</span>
+                </div>
+                <div className="row-actions">
+                  {mandate.status === 'draft' && (
+                    <button
+                      className="secondary-button compact"
+                      disabled={busy === mandate.id}
+                      onClick={() => void activate(mandate)}
+                    >
+                      Activate
+                    </button>
+                  )}
+                  {(mandate.status === 'active' || mandate.status === 'draft') && (
+                    <button
+                      className="ghost-button compact danger"
+                      disabled={busy === mandate.id}
+                      onClick={() => setRevoking(mandate)}
+                    >
+                      Revoke
+                    </button>
+                  )}
+                </div>
+              </article>
+            );
+          })}
+        </section>
+      ) : (
+        <section className="surface">
+          <EmptyState
+            icon="mandate"
+            title="No authority has been issued"
+            body="Create a mandate to define exactly where an agent can spend, how much, and why."
+            action="Create your first mandate"
+            onAction={onNewMandate}
+          />
+        </section>
+      )}
+      {revoking && (
+        <RevokeMandateDialog
+          mandate={revoking}
+          busy={busy === revoking.id}
+          onClose={() => setRevoking(null)}
+          onConfirm={async (reason) => {
+            setBusy(revoking.id);
+            setActionError(null);
+            try {
+              await api.revokeMandate(token, revoking.id, reason);
+              setRevoking(null);
+              await onRefresh();
+            } catch (error) {
+              setActionError(error instanceof Error ? error.message : String(error));
+              setRevoking(null);
+            } finally {
+              setBusy(null);
+            }
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function RevokeMandateDialog({
+  mandate,
+  busy,
+  onClose,
+  onConfirm,
+}: {
+  mandate: Mandate;
+  busy: boolean;
+  onClose: () => void;
+  onConfirm: (reason: string) => Promise<void>;
+}) {
+  const [reason, setReason] = useState('');
+  return (
+    <ModalShell onClose={busy ? () => undefined : onClose}>
+      <aside
+        className="composer revoke-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="revoke-title"
+      >
+        <div className="drawer-header">
+          <div>
+            <span className="eyebrow danger-text">Irreversible action</span>
+            <h2 id="revoke-title">Revoke {mandate.merchant} authority?</h2>
+            <p>
+              {dollars(mandate.amount_available_cents)} remains available. Warden will close
+              unused credentials and keep any settlement already in flight under review.
+            </p>
+          </div>
+          <button className="icon-button" onClick={onClose} aria-label="Close" disabled={busy}>
+            <Icon name="close" />
+          </button>
+        </div>
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            void onConfirm(reason.trim());
+          }}
+        >
+          <Field label="Reason" hint="Recorded with the mandate closure">
+            <textarea
+              required
+              minLength={3}
+              value={reason}
+              onChange={(event) => setReason(event.target.value)}
+              placeholder="Order cancelled by operator"
+              autoFocus
+            />
+          </Field>
+          <div className="composer-actions">
+            <button type="button" className="secondary-button" onClick={onClose} disabled={busy}>
+              Keep active
+            </button>
+            <button
+              type="submit"
+              className="danger-button"
+              disabled={busy || reason.trim().length < 3}
+            >
+              {busy ? 'Revoking…' : 'Revoke authority'}
+            </button>
+          </div>
+        </form>
+      </aside>
+    </ModalShell>
+  );
+}
+
+function EvidenceView({
+  evidence,
+  receipts,
+  onSelect,
+}: {
+  evidence: Evidence[];
+  receipts: Receipt[];
+  onSelect: (evidence: Evidence) => void;
+}) {
+  const unboundReceipts = receipts.filter((receipt) => !receipt.mandate_id);
+  return (
+    <div className="view-stack enter">
+      <section className="view-intro">
+        <div>
+          <span className="eyebrow accent">Append-only outcomes</span>
+          <h2>Trace every settlement back to authority.</h2>
+          <p>
+            Evidence records pair rail-observed facts with the immutable mandate and
+            policy snapshot that authorized them.
+          </p>
+        </div>
+        <div className="integrity-key">
+          <span className="seal-icon"><Icon name="shield" /></span>
+          <div>
+            <strong>
+              {evidence.every((item) => item.integrity.verified)
+                ? 'Verified SHA-256 chain'
+                : 'Integrity check failed'}
+            </strong>
+            <span>
+              {evidence.every((item) => item.integrity.verified)
+                ? 'Local tamper evidence'
+                : 'Review the evidence store'}
+            </span>
+          </div>
+        </div>
+      </section>
+
+      {evidence.length ? (
+        <section className="evidence-table">
+          <div className="evidence-table-head">
+            <span>Outcome</span>
+            <span>Authority</span>
+            <span>Integrity</span>
+            <span>Time</span>
+          </div>
+          {evidence.map((item) => (
+            <button
+              className="evidence-row"
+              key={item.id}
+              onClick={() => onSelect(item)}
+              data-testid="evidence-row"
+            >
+              <span className="evidence-outcome">
+                <span className={`outcome-mark outcome-${item.outcome}`}>
+                  <Icon name={item.decision === 'matched' ? 'check' : 'close'} />
+                </span>
+                <span>
+                  <strong>{dollars(item.amount_cents)}</strong>
+                  <small>{item.merchant}</small>
+                </span>
+              </span>
+              <span className="evidence-authority">
+                <strong>{item.purpose}</strong>
+                <small>{item.agent}</small>
+              </span>
+              <span className="hash-cell">
+                <strong>
+                  {item.integrity.verified ? 'Verified' : 'Failed'} · #
+                  {String(item.integrity.sequence).padStart(3, '0')}
+                </strong>
+                <code>{shortHash(item.integrity.evidence_hash)}</code>
+              </span>
+              <span className="evidence-time">
+                {formatDateTime(item.created_at)}
+                <Icon name="arrow" />
+              </span>
+            </button>
+          ))}
+        </section>
+      ) : (
+        <section className="surface">
+          <EmptyState
+            icon="evidence"
+            title="The evidence ledger is ready"
+            body="Settled mandate purchases will appear here with their authorization checks and integrity hash."
+          />
+        </section>
+      )}
+
+      {unboundReceipts.length > 0 && (
+        <section className="legacy-note">
+          <Icon name="clock" />
+          <div>
+            <strong>{unboundReceipts.length} legacy receipt records</strong>
+            <span>
+              These predate mandate authority and remain available through the receipts API.
+            </span>
+          </div>
+        </section>
+      )}
+    </div>
+  );
+}
+
+function MandateComposer({
+  token,
+  onClose,
+  onCreated,
+}: {
+  token: string;
+  onClose: () => void;
+  onCreated: () => Promise<void>;
+}) {
+  const [usage, setUsage] = useState<'once' | 'reusable'>('once');
+  const [advanced, setAdvanced] = useState(false);
+  const [form, setForm] = useState({
+    agent: 'procurement-agent',
+    purpose: '',
+    merchant: '',
+    budget: '',
+    perTransaction: '',
+    maxTransactions: '3',
+    expiresAt: defaultExpiry(),
+    rail: 'auto' as CreateMandateInput['rail'],
+  });
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async (event: FormEvent, activateNow: boolean) => {
+    event.preventDefault();
+    setSubmitting(true);
+    setError(null);
+    const amount = Math.round(Number(form.budget) * 100);
+    const perTransaction = form.perTransaction
+      ? Math.round(Number(form.perTransaction) * 100)
+      : amount;
+    try {
+      await api.createMandate(token, {
+        agent_name: form.agent.trim(),
+        purpose: form.purpose.trim(),
+        merchant: form.merchant.trim(),
+        amount_limit_cents: amount,
+        per_transaction_limit_cents: perTransaction,
+        max_transactions: usage === 'once' ? 1 : Number(form.maxTransactions),
+        expires_at: new Date(form.expiresAt).toISOString(),
+        rail: form.rail,
+        activate_now: activateNow,
+      });
+      await onCreated();
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <ModalShell onClose={onClose}>
+      <aside className="composer" role="dialog" aria-modal="true" aria-labelledby="composer-title">
+        <div className="drawer-header">
+          <div>
+            <span className="eyebrow accent">New authority</span>
+            <h2 id="composer-title">Create a spend mandate</h2>
+            <p>Terms become immutable when activated.</p>
+          </div>
+          <button className="icon-button" onClick={onClose} aria-label="Close">
+            <Icon name="close" />
+          </button>
+        </div>
+        <form onSubmit={(event) => void submit(event, true)}>
+          <div className="form-section">
+            <span className="form-section-label">Who and why</span>
+            <Field label="Agent" hint="The delegate receiving authority">
+              <div className="input-with-icon">
+                <Icon name="agent" />
+                <input
+                  required
+                  value={form.agent}
+                  onChange={(event) => setForm({ ...form, agent: event.target.value })}
+                  placeholder="procurement-agent"
+                  data-testid="mandate-agent"
+                />
+              </div>
+            </Field>
+            <Field label="Purpose" hint="A concrete outcome, not a generic task">
+              <textarea
+                required
+                minLength={3}
+                rows={3}
+                value={form.purpose}
+                onChange={(event) => setForm({ ...form, purpose: event.target.value })}
+                placeholder="Buy printer paper for the New York office"
+                data-testid="mandate-purpose"
+              />
+            </Field>
+          </div>
+
+          <div className="form-section">
+            <span className="form-section-label">Boundaries</span>
+            <div className="two-column-fields">
+              <Field label="Payee" hint="Required; verified again at settlement">
+                <div className="input-with-icon">
+                  <Icon name="merchant" />
+                  <input
+                    required
+                    value={form.merchant}
+                    onChange={(event) => setForm({ ...form, merchant: event.target.value })}
+                    placeholder="Staples"
+                    data-testid="mandate-merchant"
+                  />
+                </div>
+              </Field>
+              <Field label="Total budget" hint="Cumulative ceiling">
+                <div className="money-input">
+                  <span>$</span>
+                  <input
+                    required
+                    type="number"
+                    min="0.01"
+                    step="0.01"
+                    inputMode="decimal"
+                    value={form.budget}
+                    onChange={(event) => setForm({ ...form, budget: event.target.value })}
+                    placeholder="40.00"
+                    data-testid="mandate-budget"
+                  />
+                </div>
+              </Field>
+            </div>
+            <Field label="Usage">
+              <div className="segmented-control">
+                <button
+                  type="button"
+                  className={usage === 'once' ? 'active' : ''}
+                  onClick={() => setUsage('once')}
+                >
+                  One purchase
+                </button>
+                <button
+                  type="button"
+                  className={usage === 'reusable' ? 'active' : ''}
+                  onClick={() => setUsage('reusable')}
+                >
+                  Reusable
+                </button>
+              </div>
+            </Field>
+            <Field label="Expires" hint="Authority closes automatically">
+              <input
+                required
+                type="datetime-local"
+                value={form.expiresAt}
+                onChange={(event) => setForm({ ...form, expiresAt: event.target.value })}
+                data-testid="mandate-expiry"
+              />
+            </Field>
+          </div>
+
+          <button
+            type="button"
+            className="advanced-toggle"
+            onClick={() => setAdvanced(!advanced)}
+            aria-expanded={advanced}
+          >
+            <span>More controls</span>
+            <Icon name="arrow" />
+          </button>
+          {advanced && (
+            <div className="advanced-fields">
+              <Field label="Per-purchase ceiling">
+                <div className="money-input">
+                  <span>$</span>
+                  <input
+                    type="number"
+                    min="0.01"
+                    step="0.01"
+                    value={form.perTransaction}
+                    onChange={(event) =>
+                      setForm({ ...form, perTransaction: event.target.value })
+                    }
+                    placeholder={form.budget || '40.00'}
+                  />
+                </div>
+              </Field>
+              {usage === 'reusable' && (
+                <Field label="Maximum purchases">
+                  <input
+                    type="number"
+                    min="1"
+                    max="10000"
+                    value={form.maxTransactions}
+                    onChange={(event) =>
+                      setForm({ ...form, maxTransactions: event.target.value })
+                    }
+                  />
+                </Field>
+              )}
+              <Field label="Payment rail">
+                <select
+                  value={form.rail}
+                  onChange={(event) =>
+                    setForm({
+                      ...form,
+                      rail: event.target.value as CreateMandateInput['rail'],
+                    })
+                  }
+                >
+                  <option value="auto">Any configured rail</option>
+                  <option value="agentcard">AgentCard</option>
+                  <option value="stripe">Stripe</option>
+                </select>
+              </Field>
+            </div>
+          )}
+
+          {error && <div className="inline-error">{error}</div>}
+          <div className="composer-actions">
+            <button
+              type="button"
+              className="secondary-button"
+              disabled={submitting}
+              onClick={(event) => void submit(event as unknown as FormEvent, false)}
+            >
+              Save draft
+            </button>
+            <button
+              type="submit"
+              className="primary-button"
+              disabled={submitting}
+              data-testid="activate-mandate"
+            >
+              {submitting ? 'Creating authority…' : 'Create and activate'}
+              {!submitting && <Icon name="arrow" />}
+            </button>
+          </div>
+        </form>
+      </aside>
+    </ModalShell>
+  );
+}
+
+function EvidenceDrawer({
+  evidence,
+  onClose,
+}: {
+  evidence: Evidence;
+  onClose: () => void;
+}) {
+  return (
+    <ModalShell onClose={onClose}>
+      <aside className="evidence-drawer" role="dialog" aria-modal="true">
+        <div className="drawer-header">
+          <div>
+            <span className="eyebrow accent">Evidence #{String(evidence.integrity.sequence).padStart(3, '0')}</span>
+            <h2>
+              {dollars(evidence.amount_cents)} at {evidence.merchant}
+            </h2>
+            <p>{formatDateTime(evidence.created_at)}</p>
+          </div>
+          <button className="icon-button" onClick={onClose} aria-label="Close">
+            <Icon name="close" />
+          </button>
+        </div>
+
+        <div className={`decision-banner ${evidence.decision}`}>
+          <span className="seal-icon">
+            <Icon name={evidence.decision === 'matched' ? 'check' : 'close'} />
+          </span>
+          <div>
+            <strong>
+              {evidence.decision === 'matched'
+                ? 'Transaction matched its authority'
+                : 'Transaction requires review'}
+            </strong>
+            <span>
+              {evidence.decision === 'matched'
+                ? 'Rail-observed facts align with the approved mandate.'
+                : 'One or more observed facts did not match the mandate.'}
+            </span>
+          </div>
+        </div>
+
+        <section className="drawer-section">
+          <span className="form-section-label">Authorization chain</span>
+          <div className="chain">
+            <ChainItem label="Operator authority" value={String(evidence.mandate['approved_by'] ?? 'Local operator')} />
+            <ChainItem label="Purpose" value={evidence.purpose} />
+            <ChainItem label="Agent" value={evidence.agent} />
+            <ChainItem label="Observed outcome" value={`${evidence.merchant} · ${dollars(evidence.amount_cents)}`} />
+          </div>
+        </section>
+
+        <section className="drawer-section">
+          <span className="form-section-label">Verification checks</span>
+          <div className="check-list">
+            {evidence.checks.map((check) => (
+              <div className="check-row" key={check.code}>
+                <span className={`check-icon ${check.result}`}>
+                  <Icon name={check.result === 'pass' ? 'check' : 'close'} />
+                </span>
+                <div>
+                  <strong>{titleCase(check.code)}</strong>
+                  <span>{check.explanation}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="drawer-section integrity-block">
+          <div>
+            <span className="form-section-label">Integrity seal</span>
+            <strong>
+              {evidence.integrity.verified ? 'Verified SHA-256 chain' : 'Integrity check failed'}
+              , sequence {evidence.integrity.sequence}
+            </strong>
+          </div>
+          <code>{evidence.integrity.evidence_hash}</code>
+          <p>
+            Previous record:{' '}
+            {evidence.integrity.previous_hash
+              ? shortHash(evidence.integrity.previous_hash)
+              : 'Genesis record'}
+          </p>
+        </section>
+      </aside>
+    </ModalShell>
+  );
+}
+
+function PolicyEditor({
+  token,
+  onUnauthorized,
+}: {
+  token: string;
+  onUnauthorized: () => void;
+}) {
   const [agents, setAgents] = useState<AgentSummary[]>([]);
-  const [agentName, setAgentName] = useState<string | null>(null); // null = global default
-  // Free-text draft for the agent field, decoupled from `agentName` so typing
-  // doesn't reload the policy on every keystroke — only on blur/Enter. Lets
-  // you pre-configure a policy for an agent that hasn't run yet, not just
-  // pick from agents that already exist (PUT creates the agent on save).
+  const [agentName, setAgentName] = useState<string | null>(null);
   const [agentDraft, setAgentDraft] = useState('');
   const [versions, setVersions] = useState<PolicyVersion[]>([]);
   const [rules, setRules] = useState<PolicyRules>(DEFAULT_RULES);
-  const [merchantCaps, setMerchantCaps] = useState<Array<{ merchant: string; dollars: string }>>([]);
-  const [status, setStatus] = useState<{ kind: 'idle' | 'saving' | 'saved' | 'error'; message?: string }>(
-    { kind: 'idle' },
-  );
-
-  const loadAgents = useCallback(async () => {
-    try {
-      setAgents((await api.agents(token)).agents);
-    } catch (err) {
-      if (err instanceof UnauthorizedError) onUnauthorized();
-    }
-  }, [token, onUnauthorized]);
+  const [status, setStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const [message, setMessage] = useState('');
 
   const loadPolicy = useCallback(
     async (name: string | null) => {
       try {
-        const res = await api.policies(token, name);
-        setVersions(res.versions);
-        const active = res.active?.rules ?? DEFAULT_RULES;
-        setRules(active);
-        setMerchantCaps(
-          Object.entries(active.per_merchant_caps).map(([merchant, cents]) => ({
-            merchant,
-            dollars: (cents / 100).toFixed(2),
-          })),
-        );
-        setStatus({ kind: 'idle' });
-      } catch (err) {
-        if (err instanceof UnauthorizedError) onUnauthorized();
+        const response = await api.policies(token, name);
+        setVersions(response.versions);
+        setRules(response.active?.rules ?? DEFAULT_RULES);
+        setStatus('idle');
+      } catch (error) {
+        if (error instanceof UnauthorizedError) onUnauthorized();
       }
     },
     [token, onUnauthorized],
   );
 
   useEffect(() => {
-    void loadAgents();
-  }, [loadAgents]);
+    void api.agents(token).then((response) => setAgents(response.agents)).catch(() => undefined);
+  }, [token]);
   useEffect(() => {
-    void loadPolicy(agentName);
     setAgentDraft(agentName ?? '');
+    void loadPolicy(agentName);
   }, [agentName, loadPolicy]);
 
-  const commitAgentDraft = () => setAgentName(agentDraft.trim() || null);
-
   const save = async () => {
-    setStatus({ kind: 'saving' });
+    setStatus('saving');
     try {
-      const per_merchant_caps: Record<string, number> = {};
-      for (const row of merchantCaps) {
-        const merchant = row.merchant.trim();
-        const cents = Math.round(parseFloat(row.dollars || '0') * 100);
-        if (merchant && cents > 0) per_merchant_caps[merchant] = cents;
-      }
-      const res = await api.putPolicy(token, agentName, { ...rules, per_merchant_caps });
+      const response = await api.putPolicy(token, agentName, rules);
+      setStatus('saved');
+      setMessage(`Version ${response.active?.version ?? 1} is active`);
       await loadPolicy(agentName);
-      setStatus({ kind: 'saved', message: `saved as version ${res.active?.version}` });
-    } catch (err) {
-      if (err instanceof UnauthorizedError) onUnauthorized();
-      else setStatus({ kind: 'error', message: err instanceof Error ? err.message : String(err) });
+    } catch (error) {
+      if (error instanceof UnauthorizedError) onUnauthorized();
+      else {
+        setStatus('error');
+        setMessage(error instanceof Error ? error.message : String(error));
+      }
     }
   };
 
-  const csv = (list: string[]) => list.join(', ');
-  const parseCsv = (value: string) =>
-    value
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
-
   return (
-    <section className="panel policy-editor">
-      <div className="policy-header">
-        <h2>Policy</h2>
-        <input
-          className="agent-field"
-          list="policy-agents"
-          value={agentDraft}
-          placeholder="Global default (type an agent name to scope it, new or existing)"
-          onChange={(e) => setAgentDraft(e.target.value)}
-          onBlur={commitAgentDraft}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') commitAgentDraft();
-          }}
-        />
-        <datalist id="policy-agents">
-          {agents.map((a) => (
-            <option key={a.id} value={a.name} />
-          ))}
-        </datalist>
-      </div>
-      <p className="subtle">
-        {agentName
-          ? `Rules for agent "${agentName}". Falls back to the global default if this agent has none. Saving creates the agent if it doesn't exist yet.`
-          : 'Global default policy — applies to any agent without its own active policy.'}
-      </p>
+    <div className="view-stack enter">
+      <section className="view-intro">
+        <div>
+          <span className="eyebrow accent">Defense in depth</span>
+          <h2>Set the outer safety envelope.</h2>
+          <p>
+            Mandates express human intent. Policy provides the organization-wide ceiling
+            that no mandate can exceed.
+          </p>
+        </div>
+        <div className="policy-scope">
+          <label htmlFor="policy-agent">Policy scope</label>
+          <input
+            id="policy-agent"
+            list="policy-agents"
+            value={agentDraft}
+            placeholder="Global default"
+            onChange={(event) => setAgentDraft(event.target.value)}
+            onBlur={() => setAgentName(agentDraft.trim() || null)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') setAgentName(agentDraft.trim() || null);
+            }}
+          />
+          <datalist id="policy-agents">
+            {agents.map((agent) => (
+              <option key={agent.id} value={agent.name} />
+            ))}
+          </datalist>
+        </div>
+      </section>
 
-      <div className="policy-grid">
-        <label>
-          Allowed merchants <span className="subtle">(empty = allow any)</span>
-          <input
-            value={csv(rules.allowed_merchants)}
-            onChange={(e) => setRules({ ...rules, allowed_merchants: parseCsv(e.target.value) })}
+      <section className="surface policy-surface">
+        <SectionHeader
+          eyebrow={agentName ? `Agent · ${agentName}` : 'Global default'}
+          title="Spend boundaries"
+          meta={versions[0] ? `Version ${versions[0].version}` : 'Not yet saved'}
+        />
+        <div className="policy-form-grid">
+          <CsvField
+            label="Allowed merchants"
+            hint="Empty allows any merchant not blocked"
+            values={rules.allowed_merchants}
             placeholder="Staples, AWS"
+            onChange={(values) => setRules({ ...rules, allowed_merchants: values })}
           />
-        </label>
-        <label>
-          Blocked merchants
-          <input
-            value={csv(rules.blocked_merchants)}
-            onChange={(e) => setRules({ ...rules, blocked_merchants: parseCsv(e.target.value) })}
-            placeholder="sketchy-gift-cards.example"
+          <CsvField
+            label="Blocked merchants"
+            values={rules.blocked_merchants}
+            placeholder="Gift card marketplace"
+            onChange={(values) => setRules({ ...rules, blocked_merchants: values })}
           />
-        </label>
-        <label>
-          Allowed categories <span className="subtle">(empty = allow any)</span>
-          <input
-            value={csv(rules.allowed_categories)}
-            onChange={(e) => setRules({ ...rules, allowed_categories: parseCsv(e.target.value) })}
+          <CsvField
+            label="Allowed categories"
+            hint="Empty allows any category"
+            values={rules.allowed_categories}
             placeholder="office_supplies, cloud_hosting"
+            onChange={(values) => setRules({ ...rules, allowed_categories: values })}
           />
-        </label>
-        <label>
-          Default rail
-          <select
-            value={rules.default_rail}
-            onChange={(e) => setRules({ ...rules, default_rail: e.target.value as 'agentcard' | 'stripe' })}
-          >
-            <option value="agentcard">AgentCard</option>
-            <option value="stripe">Stripe</option>
-          </select>
-        </label>
-        <DollarField
-          label="Per-card cap"
-          hint="clamped to $1–$50 by the upstream network"
-          cents={rules.per_card_cap_cents}
-          onChange={(c) => setRules({ ...rules, per_card_cap_cents: c })}
-        />
-        <DollarField
-          label="Per-task budget"
-          cents={rules.per_task_budget_cents}
-          onChange={(c) => setRules({ ...rules, per_task_budget_cents: c })}
-        />
-        <DollarField
-          label="Approval threshold"
-          hint="0 = never require approval"
-          cents={rules.approval_threshold_cents}
-          onChange={(c) => setRules({ ...rules, approval_threshold_cents: c })}
-        />
-        <label>
-          Card TTL (minutes)
-          <input
-            type="number"
-            min={1}
-            value={rules.card_ttl_minutes}
-            onChange={(e) =>
-              setRules({ ...rules, card_ttl_minutes: Math.max(1, Number(e.target.value) || 1) })
-            }
+          <MerchantCapsField
+            caps={rules.per_merchant_caps}
+            onChange={(caps) => setRules({ ...rules, per_merchant_caps: caps })}
           />
-        </label>
-        <label>
-          Max cards / hour <span className="subtle">(0 = unlimited)</span>
-          <input
-            type="number"
-            min={0}
-            value={rules.velocity.max_cards_per_hour}
-            onChange={(e) =>
+          <Field label="Default rail">
+            <select
+              value={rules.default_rail}
+              onChange={(event) =>
+                setRules({
+                  ...rules,
+                  default_rail: event.target.value as PolicyRules['default_rail'],
+                })
+              }
+            >
+              <option value="agentcard">AgentCard</option>
+              <option value="stripe">Stripe</option>
+            </select>
+          </Field>
+          <MoneyPolicyField
+            label="Per-card ceiling"
+            cents={rules.per_card_cap_cents}
+            onChange={(value) => setRules({ ...rules, per_card_cap_cents: value })}
+          />
+          <MoneyPolicyField
+            label="Per-task ceiling"
+            cents={rules.per_task_budget_cents}
+            onChange={(value) => setRules({ ...rules, per_task_budget_cents: value })}
+          />
+          <MoneyPolicyField
+            label="Approval threshold"
+            hint="0 disables the threshold"
+            cents={rules.approval_threshold_cents}
+            onChange={(value) => setRules({ ...rules, approval_threshold_cents: value })}
+          />
+          <Field label="Credential TTL" hint="Minutes before an unused card expires">
+            <input
+              type="number"
+              min="1"
+              value={rules.card_ttl_minutes}
+              onChange={(event) =>
+                setRules({
+                  ...rules,
+                  card_ttl_minutes: Math.max(1, Number(event.target.value) || 1),
+                })
+              }
+            />
+          </Field>
+          <Field label="Cards per hour" hint="0 means no velocity ceiling">
+            <input
+              type="number"
+              min="0"
+              value={rules.velocity.max_cards_per_hour}
+              onChange={(event) =>
+                setRules({
+                  ...rules,
+                  velocity: {
+                    ...rules.velocity,
+                    max_cards_per_hour: Math.max(0, Number(event.target.value) || 0),
+                  },
+                })
+              }
+            />
+          </Field>
+          <MoneyPolicyField
+            label="Daily spend ceiling"
+            hint="0 means no daily ceiling"
+            cents={rules.velocity.max_amount_cents_per_day}
+            onChange={(value) =>
               setRules({
                 ...rules,
-                velocity: { ...rules.velocity, max_cards_per_hour: Math.max(0, Number(e.target.value) || 0) },
+                velocity: { ...rules.velocity, max_amount_cents_per_day: value },
               })
             }
           />
-        </label>
-        <DollarField
-          label="Max spend / day"
-          hint="0 = unlimited"
-          cents={rules.velocity.max_amount_cents_per_day}
-          onChange={(c) => setRules({ ...rules, velocity: { ...rules.velocity, max_amount_cents_per_day: c } })}
-        />
-      </div>
-
-      <h3>Per-merchant caps</h3>
-      <div className="merchant-caps">
-        {merchantCaps.map((row, i) => (
-          <div className="merchant-cap-row" key={i}>
-            <input
-              placeholder="Merchant"
-              value={row.merchant}
-              onChange={(e) =>
-                setMerchantCaps(merchantCaps.map((r, idx) => (idx === i ? { ...r, merchant: e.target.value } : r)))
-              }
-            />
-            <input
-              placeholder="0.00"
-              value={row.dollars}
-              onChange={(e) =>
-                setMerchantCaps(merchantCaps.map((r, idx) => (idx === i ? { ...r, dollars: e.target.value } : r)))
-              }
-            />
-            <button type="button" onClick={() => setMerchantCaps(merchantCaps.filter((_, idx) => idx !== i))}>
-              ×
-            </button>
-          </div>
-        ))}
-        <button type="button" onClick={() => setMerchantCaps([...merchantCaps, { merchant: '', dollars: '' }])}>
-          + add merchant cap
-        </button>
-      </div>
-
-      <div className="policy-actions">
-        <button className="save" onClick={() => void save()} disabled={status.kind === 'saving'}>
-          {status.kind === 'saving' ? 'Saving…' : 'Save policy'}
-        </button>
-        {status.kind === 'saved' && <span className="saved-msg">✓ {status.message}</span>}
-        {status.kind === 'error' && <span className="error">Failed: {status.message}</span>}
-      </div>
-
-      {versions.length > 0 && (
-        <>
-          <h3>Version history</h3>
-          <table className="version-table">
-            <thead>
-              <tr>
-                <th>Version</th>
-                <th>Status</th>
-                <th>Created</th>
-              </tr>
-            </thead>
-            <tbody>
-              {versions.map((v) => (
-                <tr key={v.id}>
-                  <td>{v.version}</td>
-                  <td>
-                    {v.active ? (
-                      <span className="rail-badge rail-agentcard">active</span>
-                    ) : (
-                      <span className="subtle">superseded</span>
-                    )}
-                  </td>
-                  <td className="mono">{new Date(v.created_at).toLocaleString()}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </>
-      )}
-    </section>
-  );
-}
-
-function DollarField({
-  label,
-  cents,
-  onChange,
-  hint,
-}: {
-  label: string;
-  cents: number;
-  onChange: (cents: number) => void;
-  hint?: string;
-}) {
-  // Decoupled draft text, committed on blur only — a controlled value that
-  // reformats to .toFixed(2) on every keystroke corrupts mid-typing (e.g.
-  // typing "40" lands as "4.00" once the first "4" reformats and shifts the
-  // cursor before "0" is typed). Found live, rehearsing the demo video.
-  const [draft, setDraft] = useState((cents / 100).toFixed(2));
-  useEffect(() => setDraft((cents / 100).toFixed(2)), [cents]);
-
-  const commit = () => {
-    const parsed = Math.max(0, Math.round((parseFloat(draft) || 0) * 100));
-    onChange(parsed);
-    setDraft((parsed / 100).toFixed(2));
-  };
-
-  return (
-    <label>
-      {label} {hint && <span className="subtle">({hint})</span>}
-      <input
-        type="text"
-        inputMode="decimal"
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={commit}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') commit();
-        }}
-      />
-    </label>
-  );
-}
-
-function RailBadge({ rail }: { rail: 'agentcard' | 'stripe' }) {
-  return <span className={`rail-badge rail-${rail}`}>{rail === 'agentcard' ? 'AgentCard' : 'Stripe'}</span>;
-}
-
-function Stat({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="stat">
-      <div className="stat-value">{value}</div>
-      <div className="stat-label">{label}</div>
+        </div>
+        <div className="policy-save-row">
+          <button
+            className="primary-button"
+            disabled={status === 'saving'}
+            onClick={() => void save()}
+          >
+            {status === 'saving' ? 'Saving…' : 'Save as new version'}
+          </button>
+          {status !== 'idle' && status !== 'saving' && (
+            <span className={status === 'error' ? 'save-state error' : 'save-state'}>
+              <Icon name={status === 'error' ? 'close' : 'check'} /> {message}
+            </span>
+          )}
+        </div>
+      </section>
     </div>
   );
 }
 
-function Drawer({ receipt, onClose }: { receipt: ReceiptDetail; onClose: () => void }) {
+function MandateSpotlight({ mandate }: { mandate: Mandate }) {
+  const consumed = mandate.reserved_cents + mandate.settled_cents;
+  const percent = Math.min(100, (consumed / mandate.amount_limit_cents) * 100);
   return (
-    <>
-      <div className="drawer-backdrop" onClick={onClose} />
-      <aside className="drawer">
-        <button className="close" onClick={onClose}>
-          ×
-        </button>
-        <h2>
-          {dollars(receipt.amount_cents)} at {receipt.merchant}
-        </h2>
-        <p className="mono subtle">{new Date(receipt.occurred_at).toLocaleString()}</p>
-
-        <h3>Why this charge happened</h3>
-        <blockquote className="intent-full">"{receipt.intent}"</blockquote>
-        <p className="subtle">
-          Triggering intent captured when agent <strong>{receipt.agent}</strong> started task{' '}
-          <span className="mono">{receipt.task_id}</span>.
-        </p>
-
-        <h3>Policy decision</h3>
-        <p>{receipt.decision_summary}</p>
-        <pre>{JSON.stringify(receipt.decision, null, 2)}</pre>
-
-        <h3>Card</h3>
-        <p>
-          <span className="mono">{receipt.card_id}</span> — single-use, auto-cancelled after this
-          authorization. Status: {receipt.transaction_status}. Issued on{' '}
-          <RailBadge rail={receipt.rail} /> rail.
-        </p>
-        {receipt.policy_id && (
-          <p className="subtle">
-            Policy version <span className="mono">{receipt.policy_id}</span>
-          </p>
-        )}
-      </aside>
-    </>
+    <div className="spotlight-content">
+      <div className="spotlight-purpose">“{mandate.purpose}”</div>
+      <div className="spotlight-meta">
+        <span><Icon name="agent" /> {mandate.agent}</span>
+        <span><Icon name="clock" /> {formatDate(mandate.expires_at)}</span>
+      </div>
+      <div className="authority-meter">
+        <div className="authority-amounts">
+          <div>
+            <span>Available</span>
+            <strong>{dollars(mandate.amount_available_cents)}</strong>
+          </div>
+          <div>
+            <span>Authorized</span>
+            <strong>{dollars(mandate.amount_limit_cents)}</strong>
+          </div>
+        </div>
+        <div className="progress-track large">
+          <span style={{ width: `${percent}%` }} />
+        </div>
+        <div className="authority-foot">
+          <span>{mandate.transaction_count} / {mandate.max_transactions} uses</span>
+          <StatusPill status={mandate.status} />
+        </div>
+      </div>
+      <div className="spotlight-proof">
+        <div><Icon name="shield" /><span>Mandate hash</span></div>
+        <code>{shortHash(mandate.mandate_hash)}</code>
+      </div>
+    </div>
   );
+}
+
+function LifecycleNode({
+  step,
+  title,
+  detail,
+  active,
+}: {
+  step: string;
+  title: string;
+  detail: string;
+  active: boolean;
+}) {
+  return (
+    <div className={`lifecycle-node ${active ? 'active' : ''}`}>
+      <span>{active ? <Icon name="check" /> : step}</span>
+      <div><strong>{title}</strong><small>{detail}</small></div>
+    </div>
+  );
+}
+
+function Metric({ label, value }: { label: string; value: string }) {
+  return <div className="metric"><strong>{value}</strong><span>{label}</span></div>;
+}
+
+function AssuranceRow({ label, detail }: { label: string; detail: string }) {
+  return (
+    <div className="assurance-row">
+      <span className="check-icon pass"><Icon name="check" /></span>
+      <strong>{label}</strong>
+      <span>{detail}</span>
+    </div>
+  );
+}
+
+function StatusPill({ status }: { status: Mandate['status'] }) {
+  return <span className={`status-pill status-${status}`}><span />{titleCase(status)}</span>;
+}
+
+function SectionHeader({
+  eyebrow,
+  title,
+  meta,
+  action,
+}: {
+  eyebrow: string;
+  title: string;
+  meta?: string;
+  action?: React.ReactNode;
+}) {
+  return (
+    <div className="section-header">
+      <div><span className="eyebrow">{eyebrow}</span><h3>{title}</h3></div>
+      {meta && <span className="section-meta">{meta}</span>}
+      {action}
+    </div>
+  );
+}
+
+function EmptyState({
+  icon,
+  title,
+  body,
+  action,
+  onAction,
+}: {
+  icon: IconName;
+  title: string;
+  body: string;
+  action?: string;
+  onAction?: () => void;
+}) {
+  return (
+    <div className="empty-state">
+      <span className="empty-icon"><Icon name={icon} /></span>
+      <strong>{title}</strong>
+      <p>{body}</p>
+      {action && onAction && <button className="secondary-button" onClick={onAction}>{action}</button>}
+    </div>
+  );
+}
+
+function LoadingState() {
+  return (
+    <div className="loading-grid" aria-label="Loading">
+      <div className="skeleton skeleton-hero" />
+      <div className="skeleton skeleton-strip" />
+      <div className="skeleton skeleton-card" />
+      <div className="skeleton skeleton-card" />
+    </div>
+  );
+}
+
+function NavButton({
+  label,
+  icon,
+  active,
+  onClick,
+}: {
+  label: string;
+  icon: IconName;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button className={`nav-button ${active ? 'active' : ''}`} onClick={onClick}>
+      <Icon name={icon} /><span>{label}</span>
+    </button>
+  );
+}
+
+function Logo() {
+  return (
+    <div className="logo">
+      <span className="logo-mark"><span /></span>
+      <span className="logo-type">Warden</span>
+    </div>
+  );
+}
+
+function Field({
+  label,
+  hint,
+  children,
+}: {
+  label: string;
+  hint?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <label className="field">
+      <span className="field-label">{label}{hint && <small>{hint}</small>}</span>
+      {children}
+    </label>
+  );
+}
+
+function CsvField({
+  label,
+  hint,
+  values,
+  placeholder,
+  onChange,
+}: {
+  label: string;
+  hint?: string;
+  values: string[];
+  placeholder: string;
+  onChange: (values: string[]) => void;
+}) {
+  return (
+    <Field label={label} hint={hint}>
+      <input
+        value={values.join(', ')}
+        placeholder={placeholder}
+        onChange={(event) =>
+          onChange(event.target.value.split(',').map((value) => value.trim()).filter(Boolean))
+        }
+      />
+    </Field>
+  );
+}
+
+function MoneyPolicyField({
+  label,
+  hint,
+  cents,
+  onChange,
+}: {
+  label: string;
+  hint?: string;
+  cents: number;
+  onChange: (cents: number) => void;
+}) {
+  const [draft, setDraft] = useState((cents / 100).toFixed(2));
+  useEffect(() => setDraft((cents / 100).toFixed(2)), [cents]);
+  const commit = () => {
+    const value = Math.max(0, Math.round((Number(draft) || 0) * 100));
+    onChange(value);
+    setDraft((value / 100).toFixed(2));
+  };
+  return (
+    <Field label={label} hint={hint}>
+      <div className="money-input">
+        <span>$</span>
+        <input
+          inputMode="decimal"
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          onBlur={commit}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') commit();
+          }}
+        />
+      </div>
+    </Field>
+  );
+}
+
+function MerchantCapsField({
+  caps,
+  onChange,
+}: {
+  caps: Record<string, number>;
+  onChange: (caps: Record<string, number>) => void;
+}) {
+  const format = (value: Record<string, number>) =>
+    Object.entries(value)
+      .map(([merchant, cents]) => `${merchant}: ${(cents / 100).toFixed(2)}`)
+      .join('\n');
+  const [draft, setDraft] = useState(format(caps));
+  useEffect(() => setDraft(format(caps)), [caps]);
+  const commit = () => {
+    const next: Record<string, number> = {};
+    for (const line of draft.split('\n')) {
+      const separator = line.lastIndexOf(':');
+      if (separator < 1) continue;
+      const merchant = line.slice(0, separator).trim();
+      const dollars = Number(line.slice(separator + 1).replace('$', '').trim());
+      if (merchant && Number.isFinite(dollars) && dollars > 0) {
+        next[merchant] = Math.round(dollars * 100);
+      }
+    }
+    onChange(next);
+  };
+  return (
+    <Field
+      label="Per-merchant ceilings"
+      hint="One per line, for example: AWS: 50.00"
+    >
+      <textarea
+        value={draft}
+        placeholder={'AWS: 50.00\nStaples: 25.00'}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={commit}
+      />
+    </Field>
+  );
+}
+
+function ModalShell({ children, onClose }: { children: React.ReactNode; onClose: () => void }) {
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [onClose]);
+  return (
+    <div className="modal-layer">
+      <button className="modal-backdrop" onClick={onClose} aria-label="Close dialog" />
+      {children}
+    </div>
+  );
+}
+
+function ChainItem({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="chain-item">
+      <span><Icon name="check" /></span>
+      <div><small>{label}</small><strong>{value}</strong></div>
+    </div>
+  );
+}
+
+function Icon({ name }: { name: IconName }) {
+  const paths: Record<IconName, React.ReactNode> = {
+    overview: <><path d="M4 5.5h6v6H4zM14 5.5h6v3h-6zM14 12.5h6v6h-6zM4 15.5h6v3H4z" /></>,
+    mandate: <><path d="M6 3.5h9l3 3v14H6z" /><path d="M15 3.5v4h4M9 11h6M9 15h6" /></>,
+    evidence: <><path d="M12 3.5 19 7v5c0 4.5-3 7.2-7 8.5C8 19.2 5 16.5 5 12V7z" /><path d="m9 12 2 2 4-4" /></>,
+    policy: <><path d="M5 6h14M5 12h14M5 18h14" /><circle cx="9" cy="6" r="2" /><circle cx="15" cy="12" r="2" /><circle cx="10" cy="18" r="2" /></>,
+    plus: <><path d="M12 5v14M5 12h14" /></>,
+    shield: <><path d="M12 3.5 19 7v5c0 4.5-3 7.2-7 8.5C8 19.2 5 16.5 5 12V7z" /><path d="m9 12 2 2 4-4" /></>,
+    arrow: <><path d="M5 12h14M14 7l5 5-5 5" /></>,
+    close: <><path d="m6 6 12 12M18 6 6 18" /></>,
+    check: <><path d="m6 12 4 4 8-9" /></>,
+    clock: <><circle cx="12" cy="12" r="8.5" /><path d="M12 7v5l3 2" /></>,
+    merchant: <><path d="M4 9h16l-2-5H6zM6 9v11h12V9M9 20v-6h6v6" /></>,
+    agent: <><circle cx="12" cy="8" r="3.5" /><path d="M5 20c.7-4 3-6 7-6s6.3 2 7 6" /></>,
+  };
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      {paths[name]}
+    </svg>
+  );
+}
+
+function defaultExpiry(): string {
+  const date = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+  date.setMinutes(date.getMinutes() - date.getTimezoneOffset());
+  return date.toISOString().slice(0, 16);
+}
+
+function formatDate(value: string): string {
+  return new Date(value).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+function formatDateTime(value: string): string {
+  return new Date(value).toLocaleString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+}
+
+function relativeTime(value: string): string {
+  const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1000));
+  if (seconds < 60) return 'now';
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86_400) return `${Math.floor(seconds / 3600)}h`;
+  return `${Math.floor(seconds / 86_400)}d`;
+}
+
+function shortHash(value: string | null | undefined): string {
+  if (!value) return 'Pending activation';
+  return `${value.slice(0, 10)}…${value.slice(-6)}`;
+}
+
+function titleCase(value: string): string {
+  return value
+    .replaceAll('_', ' ')
+    .replace(/\b\w/g, (character) => character.toUpperCase());
 }

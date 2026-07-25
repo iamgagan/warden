@@ -154,7 +154,11 @@ export class StripeUpstream implements UpstreamClient {
       }));
 
     const fromTxns: UpstreamTxn[] = transactions.data.map((t) => ({
-      id: t.id,
+      // Stripe models authorization and capture as separate object IDs.
+      // Normalize them to the authorization ID so Warden observes one
+      // transaction evolving PENDING → SETTLED instead of two purchases.
+      // The native capture ID remains preserved in `raw`.
+      id: authorizationId(t) ?? t.id,
       card_id,
       merchant: t.merchant_data.name ?? 'unknown',
       // Stripe's issuing.transactions.amount is signed by ledger convention

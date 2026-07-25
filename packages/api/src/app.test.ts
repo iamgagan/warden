@@ -6,6 +6,8 @@ import { createApiApp } from './app.js';
 
 const TOKEN = 'test-token';
 const auth = { headers: { authorization: `Bearer ${TOKEN}` } };
+const futureExpiry = (): string =>
+  new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
 
 let db: WardenDb;
 let upstream: MockUpstream;
@@ -22,6 +24,8 @@ beforeEach(() => {
     upstreams: { agentcard: upstream },
     mode: 'test',
     reconcileNow: () => reconciler.runOnce(),
+    actorAgentName: 'procurement-agent',
+    allowLegacyTasks: true,
   });
   app = createApiApp({
     repo: db.repo,
@@ -62,6 +66,79 @@ describe('auth', () => {
     reconciler.status.upstream_auth = 'needs_login';
     const after = await (await app.request('/healthz')).json();
     expect(after.upstream_auth).toBe('needs_login');
+  });
+});
+
+describe('mandates', () => {
+  it('creates, activates, lists, and revokes operator-approved authority', async () => {
+    const createdResponse = await app.request('/api/v1/mandates', {
+      ...auth,
+      method: 'POST',
+      headers: { ...auth.headers, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        agent_name: 'procurement-agent',
+        purpose: 'Buy printer paper for the New York office',
+        merchant: 'Staples',
+        amount_limit_cents: 4000,
+        per_transaction_limit_cents: 2500,
+        max_transactions: 3,
+        expires_at: futureExpiry(),
+        rail: 'agentcard',
+        activate_now: false,
+      }),
+    });
+    expect(createdResponse.status).toBe(201);
+    const created = await createdResponse.json();
+    expect(created.mandate).toMatchObject({
+      status: 'draft',
+      agent: 'procurement-agent',
+      merchant: 'Staples',
+      amount_limit_cents: 4000,
+    });
+
+    const activatedResponse = await app.request(
+      `/api/v1/mandates/${created.mandate.id}/activate`,
+      { ...auth, method: 'POST' },
+    );
+    expect(activatedResponse.status).toBe(200);
+    const activated = await activatedResponse.json();
+    expect(activated.mandate).toMatchObject({
+      status: 'active',
+      amount_available_cents: 4000,
+    });
+    expect(activated.mandate.task_id).toBeTruthy();
+
+    const listed = await (await app.request('/api/v1/mandates', auth)).json();
+    expect(listed.mandates).toHaveLength(1);
+
+    const revokedResponse = await app.request(
+      `/api/v1/mandates/${created.mandate.id}/revoke`,
+      {
+        ...auth,
+        method: 'POST',
+        headers: { ...auth.headers, 'content-type': 'application/json' },
+        body: JSON.stringify({ reason: 'No longer needed' }),
+      },
+    );
+    expect(revokedResponse.status).toBe(200);
+    expect((await revokedResponse.json()).mandate.status).toBe('revoked');
+  });
+
+  it('rejects invalid or already-expired authority', async () => {
+    const response = await app.request('/api/v1/mandates', {
+      ...auth,
+      method: 'POST',
+      headers: { ...auth.headers, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        agent_name: 'procurement-agent',
+        purpose: 'Buy paper',
+        merchant: '',
+        amount_limit_cents: 0,
+        max_transactions: 1,
+        expires_at: '2020-01-01T00:00:00.000Z',
+      }),
+    });
+    expect(response.status).toBe(400);
   });
 });
 
@@ -112,6 +189,81 @@ describe('receipts', () => {
     expect(detail.decision).toMatchObject({ decision: 'issue', card_amount_cents: 500, sandbox: true });
     expect((await app.request('/api/v1/receipts/nope', auth)).status).toBe(404);
   });
+
+  it('exposes mandate-bound integrity evidence for a settled purchase', async () => {
+    const agent = db.repo.getOrCreateAgent('procurement-agent');
+    const mandate = db.repo.activateMandate(
+      db.repo.createMandate({
+        agentId: agent.id,
+        purpose: 'Buy paper',
+        merchant: 'Staples',
+        amountLimitCents: 2000,
+        perTransactionLimitCents: 2000,
+        maxTransactions: 1,
+        expiresAt: futureExpiry(),
+        rail: 'agentcard',
+        createdBy: 'Local operator',
+      }).id,
+      'Local operator',
+    );
+    const { card_id } = await service.issueCard({
+      task_id: mandate.taskId!,
+      amount_cents: 1500,
+      merchant: 'Staples',
+      idempotency_key: 'checkout-1',
+    });
+    upstream.simulatePurchase(card_id, { merchant: 'STAPLES', amount_cents: 1499 });
+    await reconciler.runOnce();
+
+    const evidenceResponse = await app.request('/api/v1/evidence', auth);
+    expect(evidenceResponse.status).toBe(200);
+    const evidence = await evidenceResponse.json();
+    expect(evidence.evidence).toHaveLength(1);
+    expect(evidence.evidence[0]).toMatchObject({
+      mandate_id: mandate.id,
+      outcome: 'settled',
+      decision: 'matched',
+      merchant: 'STAPLES',
+      integrity: {
+        kind: 'sha256_chain_v1',
+        sequence: 1,
+        previous_hash: null,
+        verified: true,
+      },
+    });
+    expect(evidence.chain_verification).toEqual({
+      verified: true,
+      checked_records: 1,
+      first_invalid_sequence: null,
+    });
+
+    const receipts = await (await app.request('/api/v1/receipts', auth)).json();
+    const detail = await (
+      await app.request(`/api/v1/receipts/${receipts.receipts[0].id}`, auth)
+    ).json();
+    expect(detail).toMatchObject({
+      mandate_id: mandate.id,
+      evidence_hash: evidence.evidence[0].integrity.evidence_hash,
+    });
+
+    db.sqlite.prepare("UPDATE transactions SET merchant = 'Tampered merchant'").run();
+    db.sqlite.prepare("UPDATE mandates SET purpose = 'Tampered purpose'").run();
+    const joinedTamper = await (await app.request('/api/v1/evidence', auth)).json();
+    expect(joinedTamper.chain_verification.verified).toBe(true);
+    expect(joinedTamper.evidence[0]).toMatchObject({
+      merchant: 'STAPLES',
+      purpose: 'Buy paper',
+      integrity: { verified: true },
+    });
+
+    db.sqlite.prepare("UPDATE evidence SET payload_json = '{\"tampered\":true}'").run();
+    const tampered = await (await app.request('/api/v1/evidence', auth)).json();
+    expect(tampered.chain_verification).toMatchObject({
+      verified: false,
+      first_invalid_sequence: 1,
+    });
+    expect(tampered.evidence[0].integrity.verified).toBe(false);
+  });
 });
 
 describe('agents, events, stats', () => {
@@ -147,6 +299,9 @@ describe('agents, events, stats', () => {
       receipts_total: 0,
       blocks_total: 0,
       avg_blast_radius_cents: 1500, // one task with $15.00 open exposure
+      active_mandates: 0,
+      authority_available_cents: 0,
+      evidence_total: 0,
     });
   });
 });

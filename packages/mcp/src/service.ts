@@ -1,5 +1,8 @@
+import { createHash } from 'node:crypto';
 import {
   DEFAULT_POLICY,
+  UPSTREAM_MAX_CARD_CENTS,
+  UPSTREAM_MIN_CARD_CENTS,
   evaluateIssue,
   evaluatePurchase,
   parsePolicyRules,
@@ -24,6 +27,16 @@ export interface WardenServiceOptions {
   /** Wired to the reconciler in T8; complete_task triggers one immediate pass. */
   reconcileNow?: () => Promise<void>;
   now?: () => number;
+  /**
+   * Identity bound by the MCP process configuration. Mandate authority is
+   * unavailable without it and can never be selected from a tool argument.
+   */
+  actorAgentName?: string;
+  /**
+   * Compatibility escape hatch for pre-mandate clients. Disabled by default
+   * so an agent cannot self-declare authority around the operator workflow.
+   */
+  allowLegacyTasks?: boolean;
 }
 
 /**
@@ -36,6 +49,8 @@ export class WardenService {
   private readonly mode: WardenMode;
   private readonly reconcileNow: () => Promise<void>;
   private readonly nowMs: () => number;
+  private readonly actorAgentName: string | undefined;
+  private readonly allowLegacyTasks: boolean;
 
   constructor(opts: WardenServiceOptions) {
     this.repo = opts.repo;
@@ -43,6 +58,8 @@ export class WardenService {
     this.mode = opts.mode;
     this.reconcileNow = opts.reconcileNow ?? (async () => undefined);
     this.nowMs = opts.now ?? Date.now;
+    this.actorAgentName = opts.actorAgentName;
+    this.allowLegacyTasks = opts.allowLegacyTasks ?? false;
   }
 
   get sandbox(): boolean {
@@ -79,11 +96,41 @@ export class WardenService {
     return task;
   }
 
+  private assertMandateActor(task: TaskRow): void {
+    if (!task.mandateId) return;
+    const delegatedAgent = this.repo.getAgent(task.agentId);
+    if (!this.actorAgentName) {
+      throw new WardenToolError(
+        'POLICY_BLOCKED',
+        'mandate tools require an MCP identity binding (set WARDEN_AGENT_NAME)',
+        { reason: 'agent_identity_required', mandate_id: task.mandateId },
+      );
+    }
+    if (!delegatedAgent || delegatedAgent.name !== this.actorAgentName) {
+      throw new WardenToolError(
+        'POLICY_BLOCKED',
+        `mandate authority belongs to ${delegatedAgent?.name ?? 'another agent'}`,
+        {
+          reason: 'wrong_agent',
+          mandate_id: task.mandateId,
+          delegated_agent: delegatedAgent?.name ?? null,
+        },
+      );
+    }
+  }
+
   startTask(input: { agent_name: string; intent: string; budget_cents?: number }): {
     task_id: string;
     budget_cents: number;
     policy_summary: string;
   } {
+    if (!this.allowLegacyTasks) {
+      throw new WardenToolError(
+        'POLICY_BLOCKED',
+        'operator-approved authority is required; start an active mandate instead',
+        { reason: 'operator_mandate_required' },
+      );
+    }
     const agent = this.repo.getOrCreateAgent(input.agent_name);
     const policyRow = this.repo.getActivePolicy(agent.id);
     const rules = policyRow ? parsePolicyRules(policyRow.rulesJson) : DEFAULT_POLICY;
@@ -104,12 +151,86 @@ export class WardenService {
     };
   }
 
+  startMandateTask(input: { mandate_id: string }): {
+    mandate_id: string;
+    task_id: string;
+    merchant: string;
+    amount_available_cents: number;
+    expires_at: string;
+    policy_summary: string;
+  } {
+    const mandate = this.repo.getMandate(input.mandate_id);
+    if (!mandate) {
+      throw new WardenToolError('TASK_NOT_ACTIVE', `unknown mandate ${input.mandate_id}`);
+    }
+    if (mandate.status !== 'active' || !mandate.taskId) {
+      throw new WardenToolError(
+        'TASK_NOT_ACTIVE',
+        `mandate ${input.mandate_id} is ${mandate.status}`,
+        { status: mandate.status },
+      );
+    }
+    const task = this.activeTaskOrThrow(mandate.taskId);
+    this.assertMandateActor(task);
+    const { rules } = this.loadPolicy(task);
+    return {
+      mandate_id: mandate.id,
+      task_id: task.id,
+      merchant: mandate.merchant,
+      amount_available_cents:
+        mandate.amountLimitCents - mandate.reservedCents - mandate.settledCents,
+      expires_at: mandate.expiresAt,
+      policy_summary: summarizePolicy(rules, task.budgetCents),
+    };
+  }
+
+  listMyMandates(): {
+    agent: string;
+    mandates: Array<{
+      mandate_id: string;
+      purpose: string;
+      merchant: string;
+      amount_available_cents: number;
+      per_transaction_limit_cents: number;
+      transactions_remaining: number;
+      expires_at: string;
+      rail: 'auto' | Rail;
+    }>;
+  } {
+    if (!this.actorAgentName) {
+      throw new WardenToolError(
+        'POLICY_BLOCKED',
+        'mandate discovery requires an MCP identity binding (set WARDEN_AGENT_NAME)',
+        { reason: 'agent_identity_required' },
+      );
+    }
+    const agent = this.repo.getAgentByName(this.actorAgentName);
+    const mandates = agent
+      ? this.repo
+          .listMandates('active')
+          .filter((mandate) => mandate.agentId === agent.id)
+          .map((mandate) => ({
+            mandate_id: mandate.id,
+            purpose: mandate.purpose,
+            merchant: mandate.merchant,
+            amount_available_cents:
+              mandate.amountLimitCents - mandate.reservedCents - mandate.settledCents,
+            per_transaction_limit_cents: mandate.perTransactionLimitCents,
+            transactions_remaining: mandate.maxTransactions - mandate.transactionCount,
+            expires_at: mandate.expiresAt,
+            rail: mandate.rail,
+          }))
+      : [];
+    return { agent: this.actorAgentName, mandates };
+  }
+
   async issueCard(input: {
     task_id: string;
     amount_cents: number;
     merchant?: string;
     category?: string;
     rail?: Rail;
+    idempotency_key?: string;
   }): Promise<{
     card_id: string;
     amount_cents: number;
@@ -118,8 +239,59 @@ export class WardenService {
     rail: Rail;
   }> {
     const task = this.activeTaskOrThrow(input.task_id);
+    this.assertMandateActor(task);
     const { rules, policyId } = this.loadPolicy(task);
     const rail = input.rail ?? rules.default_rail;
+
+    if (task.mandateId) {
+      const mandate = this.repo.getMandate(task.mandateId);
+      if (!mandate || mandate.status !== 'active') {
+        throw new WardenToolError(
+          'TASK_NOT_ACTIVE',
+          `mandate ${task.mandateId} is ${mandate?.status ?? 'missing'}`,
+          { status: mandate?.status ?? 'missing' },
+        );
+      }
+    }
+
+    if (task.mandateId && input.idempotency_key) {
+      const existing = this.repo.getAuthorizationByIdempotency(
+        task.mandateId,
+        input.idempotency_key,
+      );
+      if (existing?.cardId) {
+        if (existing.status === 'released') {
+          throw new WardenToolError(
+            'POLICY_BLOCKED',
+            'the previous authorization is closed; use a new idempotency key',
+            { reason: 'authorization_released', mandate_id: task.mandateId },
+          );
+        }
+        const canonicalAmount = Math.max(
+          UPSTREAM_MIN_CARD_CENTS,
+          Math.min(UPSTREAM_MAX_CARD_CENTS, input.amount_cents),
+        );
+        const sameRequest =
+          existing.amountCents === canonicalAmount &&
+          normalizeMerchant(existing.merchant) === normalizeMerchant(input.merchant ?? '') &&
+          existing.category === (input.category ?? null) &&
+          existing.rail === rail;
+        if (!sameRequest) {
+          throw new WardenToolError(
+            'POLICY_BLOCKED',
+            'the idempotency key was already used for a different request',
+            { reason: 'idempotency_conflict', mandate_id: task.mandateId },
+          );
+        }
+        return {
+          card_id: existing.cardId,
+          amount_cents: existing.amountCents,
+          single_use: true,
+          expires: '7d-unused',
+          rail: existing.rail,
+        };
+      }
+    }
 
     const hourAgo = new Date(this.nowMs() - 60 * 60 * 1000).toISOString();
     const dayAgo = new Date(this.nowMs() - 24 * 60 * 60 * 1000).toISOString();
@@ -163,6 +335,94 @@ export class WardenService {
       });
     }
 
+    let authorizationId: string | null = null;
+    if (task.mandateId) {
+      if (!input.merchant?.trim()) {
+        throw new WardenToolError(
+          'POLICY_BLOCKED',
+          'a merchant is required for mandate-authorized spending',
+          { reason: 'merchant_required' },
+        );
+      }
+      if (!input.idempotency_key?.trim()) {
+        throw new WardenToolError(
+          'POLICY_BLOCKED',
+          'idempotency_key is required for mandate-authorized spending',
+          { reason: 'idempotency_key_required' },
+        );
+      }
+      const requestHash = createHash('sha256')
+        .update(
+          JSON.stringify({
+            taskId: task.id,
+            amountCents: decision.card_amount_cents,
+            merchant: input.merchant.trim().toLocaleLowerCase(),
+            category: input.category ?? null,
+            rail,
+          }),
+        )
+        .digest('hex');
+      const reservation = this.repo.reserveAuthorization({
+        mandateId: task.mandateId,
+        taskId: task.id,
+        idempotencyKey: input.idempotency_key,
+        requestHash,
+        amountCents: decision.card_amount_cents,
+        merchant: input.merchant,
+        category: input.category ?? null,
+        rail,
+      });
+      if (reservation.kind === 'denied') {
+        this.repo.insertPolicyEvent({
+          type: 'block',
+          taskId: task.id,
+          agentId: task.agentId,
+          detailsJson: JSON.stringify({
+            reasons: [reservation.reason],
+            request: input,
+            mandate_id: task.mandateId,
+            enforced_at: 'authorization',
+          }),
+        });
+        throw new WardenToolError('POLICY_BLOCKED', mandateReason(reservation.reason), {
+          reason: reservation.reason,
+          mandate_id: task.mandateId,
+        });
+      }
+      authorizationId = reservation.authorization.id;
+      if (reservation.kind === 'existing') {
+        if (reservation.authorization.cardId) {
+          return {
+            card_id: reservation.authorization.cardId,
+            amount_cents: reservation.authorization.amountCents,
+            single_use: true,
+            expires: '7d-unused',
+            rail: reservation.authorization.rail,
+          };
+        }
+        throw new WardenToolError(
+          'APPROVAL_PENDING',
+          'the matching authorization is already being provisioned; retry shortly',
+          {
+            authorization_id: reservation.authorization.id,
+            mandate_id: task.mandateId,
+          },
+        );
+      }
+    } else if (!this.repo.tryReserveTaskSpend(task.id, decision.card_amount_cents)) {
+      this.repo.insertPolicyEvent({
+        type: 'block',
+        taskId: task.id,
+        agentId: task.agentId,
+        detailsJson: JSON.stringify({
+          reasons: ['task budget is no longer available'],
+          request: input,
+          enforced_at: 'authorization',
+        }),
+      });
+      throw new WardenToolError('BUDGET_EXCEEDED', 'task budget is no longer available');
+    }
+
     let cardId: string;
     try {
       const created = await this.upstreamFor(rail).createCard({
@@ -171,20 +431,31 @@ export class WardenService {
       });
       cardId = created.card_id;
     } catch (err) {
+      if (authorizationId) this.repo.releaseAuthorization(authorizationId);
+      else this.repo.addTaskSpent(task.id, -decision.card_amount_cents);
       throw upstreamToolError(err);
     }
 
-    this.repo.insertCard({
-      id: cardId,
-      taskId: task.id,
-      amountCents: decision.card_amount_cents,
-      merchantHint: input.merchant ?? null,
-      sandbox: this.sandbox,
-      rail,
-    });
-    // Reserve the card amount against the task budget; the reconciler trues
-    // this up to settled amounts (releases the unspent remainder).
-    this.repo.addTaskSpent(task.id, decision.card_amount_cents);
+    try {
+      this.repo.insertCard({
+        id: cardId,
+        taskId: task.id,
+        amountCents: decision.card_amount_cents,
+        merchantHint: input.merchant ?? null,
+        sandbox: this.sandbox,
+        rail,
+      });
+      if (authorizationId) this.repo.bindAuthorizationCard(authorizationId, cardId);
+    } catch (err) {
+      if (authorizationId) this.repo.releaseAuthorization(authorizationId);
+      else this.repo.addTaskSpent(task.id, -decision.card_amount_cents);
+      try {
+        await this.upstreamFor(rail).closeCard(cardId);
+      } catch {
+        // The local failure is primary; reconciliation/TTL cleanup remains the safety net.
+      }
+      throw err;
+    }
     this.repo.insertPolicyEvent({
       type: 'card_issued',
       taskId: task.id,
@@ -220,14 +491,44 @@ export class WardenService {
     category?: string;
   }): { decision: 'allow' | 'block' | 'needs_approval'; reasons: string[] } {
     const task = this.activeTaskOrThrow(input.task_id);
+    this.assertMandateActor(task);
     const { rules } = this.loadPolicy(task);
-    const result = evaluatePurchase(rules, {
+    const policyResult = evaluatePurchase(rules, {
       merchant: input.merchant,
       amount_cents: input.amount_cents,
       category: input.category,
       taskSpentCents: task.spentCents,
       taskBudgetCents: task.budgetCents,
     });
+    const mandateReasons: string[] = [];
+    if (task.mandateId) {
+      const mandate = this.repo.getMandate(task.mandateId);
+      if (!mandate || mandate.status !== 'active') {
+        mandateReasons.push(`mandate is ${mandate?.status ?? 'missing'}`);
+      } else {
+        if (normalizeMerchant(mandate.merchant) !== normalizeMerchant(input.merchant)) {
+          mandateReasons.push(`merchant "${input.merchant}" does not match mandate payee "${mandate.merchant}"`);
+        }
+        if (input.amount_cents > mandate.perTransactionLimitCents) {
+          mandateReasons.push(
+            `amount ${input.amount_cents} exceeds mandate per-transaction limit ${mandate.perTransactionLimitCents}`,
+          );
+        }
+        if (
+          input.amount_cents >
+          mandate.amountLimitCents - mandate.reservedCents - mandate.settledCents
+        ) {
+          mandateReasons.push('amount exceeds remaining mandate authority');
+        }
+        if (mandate.transactionCount >= mandate.maxTransactions) {
+          mandateReasons.push('mandate transaction limit has been reached');
+        }
+      }
+    }
+    const result =
+      mandateReasons.length > 0
+        ? { decision: 'block' as const, reasons: mandateReasons }
+        : policyResult;
     if (result.decision === 'block') {
       this.repo.insertPolicyEvent({
         type: 'block',
@@ -251,7 +552,18 @@ export class WardenService {
         state: card.state,
       });
     }
-    this.activeTaskOrThrow(card.taskId);
+    const task = this.activeTaskOrThrow(card.taskId);
+    this.assertMandateActor(task);
+    if (task.mandateId) {
+      const mandate = this.repo.getMandate(task.mandateId);
+      if (!mandate || mandate.status !== 'active') {
+        throw new WardenToolError(
+          'TASK_NOT_ACTIVE',
+          `mandate ${task.mandateId} is ${mandate?.status ?? 'missing'}`,
+          { status: mandate?.status ?? 'missing' },
+        );
+      }
+    }
     try {
       // Pass-through only: PAN/CVV stay in memory, never persisted or logged.
       return await this.upstreamFor(card.rail).getCardDetails(input.card_id);
@@ -268,6 +580,14 @@ export class WardenService {
     total_spent_cents: number;
   }> {
     const task = this.activeTaskOrThrow(input.task_id);
+    this.assertMandateActor(task);
+    if (task.mandateId) {
+      throw new WardenToolError(
+        'POLICY_BLOCKED',
+        'mandate tasks stay open for their approved lifetime; revoke the mandate from the operator console to close it',
+        { reason: 'mandate_controlled_lifecycle', mandate_id: task.mandateId },
+      );
+    }
     // Catch up on settlements first: a card whose purchase already settled
     // upstream must become 'used' (keeping its spend) before we close the
     // remainder and release their reservations.
@@ -283,7 +603,9 @@ export class WardenService {
       }
       this.repo.setCardState(card.id, 'closed');
       // Release the unused reservation.
-      this.repo.addTaskSpent(task.id, -card.amountCents);
+      const authorization = this.repo.getAuthorizationByCard(card.id);
+      if (authorization) this.repo.releaseAuthorization(authorization.id);
+      else this.repo.addTaskSpent(task.id, -card.amountCents);
       this.repo.insertPolicyEvent({
         type: 'card_closed',
         taskId: task.id,
@@ -302,6 +624,24 @@ export class WardenService {
       total_spent_cents: finalTask.spentCents,
     };
   }
+}
+
+function mandateReason(reason: string): string {
+  const reasons: Record<string, string> = {
+    mandate_not_active: 'the mandate is not active',
+    mandate_expired: 'the mandate has expired',
+    merchant_not_allowed: 'the merchant does not match the operator-approved payee',
+    rail_not_allowed: 'the requested payment rail is outside the mandate',
+    amount_exceeds_limit: 'the amount exceeds the mandate per-transaction limit',
+    transaction_limit_reached: 'the mandate transaction limit has been reached',
+    budget_unavailable: 'the mandate does not have enough authority remaining',
+    idempotency_conflict: 'the idempotency key was already used for a different request',
+  };
+  return reasons[reason] ?? reason;
+}
+
+function normalizeMerchant(value: string): string {
+  return value.normalize('NFKC').toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
 }
 
 function summarizePolicy(rules: PolicyRules, budgetCents: number): string {

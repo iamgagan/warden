@@ -21,7 +21,12 @@ function main(): void {
   const port = Number(process.env['PORT'] ?? 8787);
 
   const db = openWardenDb(dbPath);
-  const app = createApiApp({ repo: db.repo, apiToken, mode });
+  const app = createApiApp({
+    repo: db.repo,
+    apiToken,
+    mode,
+    operatorName: process.env['WARDEN_OPERATOR_NAME'],
+  });
 
   const webDist = process.env['WARDEN_WEB_DIST'] ?? join(process.cwd(), 'apps', 'web', 'dist');
   if (existsSync(webDist)) {

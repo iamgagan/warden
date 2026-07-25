@@ -69,6 +69,8 @@ async function main(): Promise<void> {
     upstreams,
     mode,
     reconcileNow: () => reconciler.runOnce(),
+    actorAgentName: process.env['WARDEN_AGENT_NAME'],
+    allowLegacyTasks: process.env['WARDEN_ALLOW_LEGACY_TASKS'] === 'true',
   });
 
   const server = createWardenMcpServer(service);

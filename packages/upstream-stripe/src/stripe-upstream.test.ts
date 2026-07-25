@@ -169,6 +169,27 @@ describe('StripeUpstream', () => {
     });
   });
 
+  it('normalizes Stripe authorization and capture IDs into one transaction lifecycle', async () => {
+    const stripe = fakeStripe();
+    const upstream = new StripeUpstream(stripe);
+    const { card_id } = await upstream.createCard({ amount_cents: 1899, sandbox: true });
+    const authorization = await stripe.testHelpers.issuing.authorizations.create({
+      card: card_id,
+      amount: 1899,
+      currency: 'usd',
+      merchant_data: { name: 'Staples' },
+    });
+
+    expect(await upstream.listTransactions(card_id)).toMatchObject([
+      { id: authorization.id, status: 'PENDING' },
+    ]);
+    await stripe.testHelpers.issuing.authorizations.capture(authorization.id);
+    const settled = await upstream.listTransactions(card_id);
+    expect(settled).toHaveLength(1);
+    expect(settled[0]).toMatchObject({ id: authorization.id, status: 'SETTLED' });
+    expect((settled[0]?.raw as StripeTransaction).id).toMatch(/^ipi_/);
+  });
+
   it('reports a declined authorization when the purchase exceeds the card cap', async () => {
     const stripe = fakeStripe();
     const upstream = new StripeUpstream(stripe);

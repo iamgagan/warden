@@ -1,12 +1,11 @@
 # Warden
 
-Spend guardrails + audit receipts for AI agents that pay with virtual cards, built on the
-[AgentCard](https://agentcard.sh) MCP. Humans set budgets and rules; Warden enforces them by
-minting single-use scoped cards ($1–$50, auto-cancel after one authorization) so hard limits
-live at the card network, and binds every charge to the agent's triggering intent as an
-append-only receipt.
+Warden is the operator authority layer for AI-agent spending. Before an agent can pay, a
+human creates an immutable mandate naming the delegate, purpose, payee, total budget,
+per-purchase ceiling, use count, payment rail, and expiry. Warden turns that authority into
+atomic single-use card reservations and hash-linked settlement evidence.
 
-Every dollar, with the why.
+**Every agent dollar starts with your decision.**
 
 ## How it works
 
@@ -19,13 +18,20 @@ Agent ──MCP──▶ warden-mcp (policy + proxy) ──MCP/OAuth──▶ ag
               warden-api (Hono) ◀── dashboard (React)
 ```
 
-- **warden_start_task** — agent declares its intent and gets a budget envelope
-- **warden_issue_card** — one single-use card per purchase, deterministically policy-checked
+- **warden_list_my_mandates** — a bound agent discovers only authority delegated to it
+- **warden_start_mandate_task** — opens one active operator-approved mandate
+- **warden_issue_card** — atomically reserves authority and mints one single-use card
 - **warden_get_card_details** — pass-through PAN/CVV for open cards (never persisted)
-- **warden_complete_task** — closes open cards, releases unused budget
+- **reconciler** — turns rail outcomes into append-only, hash-linked evidence
 
-Declines happen at the card network, not in software an agent can route around. The policy
-engine is pure and deterministic; no ML in the enforcement path. Warden never holds funds.
+`warden_start_task` and `warden_complete_task` remain compatibility tools for the older
+self-declared workflow. They are disabled by default and require
+`WARDEN_ALLOW_LEGACY_TASKS=true`.
+
+Amount caps are enforced by the issuing rail. Payee intent is checked before issuance and
+verified against the observed merchant at settlement; network-level merchant binding depends
+on the selected rail's capabilities. The policy engine is deterministic, and Warden never
+holds funds or stores PAN/CVV.
 
 ## Quickstart
 
@@ -38,29 +44,33 @@ pnpm test          # all offline, runs against the in-process mock upstream
 node packages/cli/dist/cli.js auth
 node packages/cli/dist/cli.js auth --status
 
-# run the MCP proxy your agent connects to (stdio)
-WARDEN_DB_PATH=./warden.db node packages/mcp/dist/main.js
+# run one identity-bound MCP proxy per delegated agent (stdio)
+WARDEN_AGENT_NAME=procurement-agent WARDEN_DB_PATH=./warden.db node packages/mcp/dist/main.js
 
 # run the API + dashboard
-WARDEN_API_TOKEN=<pick-a-token> WARDEN_DB_PATH=./warden.db node packages/api/dist/main.js
+WARDEN_API_TOKEN=<pick-a-token> WARDEN_OPERATOR_NAME="Your name" \
+  WARDEN_DB_PATH=./warden.db node packages/api/dist/main.js
 # open http://localhost:8787 and enter the token
 ```
 
 Sandbox by default: `WARDEN_MODE=test` (the default) passes `sandbox: true` on every card.
+Create and activate a mandate in the dashboard. The bound agent can then call
+`warden_list_my_mandates`, select the relevant authority, and call
+`warden_start_mandate_task` without an operator copying database IDs into a prompt.
 
 ### Offline demo (no credentials needed)
 
-The demo agent drives warden-mcp over stdio exactly like a real agent's MCP client
-(same transport, same tools, same errors) against the in-process mock rail:
+The demo drives the mandate-first workflow over stdio exactly like a real agent's MCP client
+(same identity binding, discovery, tools, and errors) against the in-process mock rail:
 
 ```bash
-# terminal 1 — dashboard
-node packages/mcp/dist/demo-agent.js ./warden-demo.db --fresh   # creates the db, exits
-WARDEN_API_TOKEN=demo-token WARDEN_DB_PATH=./warden-demo.db node packages/api/dist/main.js
+# terminal 1 — dashboard (choose an unused database path for each run)
+WARDEN_API_TOKEN=demo-token WARDEN_DB_PATH=/private/tmp/warden-demo-01.db \
+  node packages/api/dist/main.js
 
-# terminal 2 — narrated agent run: task → card → purchase → receipt → injected
-# purchase blocked (POLICY_BLOCKED, no card ever minted) → task complete
-node packages/mcp/dist/demo-agent.js ./warden-demo.db --fresh
+# terminal 2 — narrated run: operator mandate → agent discovery → authorization
+# → settlement evidence → injected purchase blocked before a card exists
+node packages/mcp/dist/demo-agent.js /private/tmp/warden-demo-01.db
 ```
 
 `scripts/seed-demo.mjs` seeds a richer multi-agent dataset for dashboard browsing.
@@ -87,7 +97,10 @@ against the real Stripe sandbox (never CI), mirroring `scripts/e2e-real.mjs` for
     "warden": {
       "command": "node",
       "args": ["/path/to/warden/packages/mcp/dist/main.js"],
-      "env": { "WARDEN_DB_PATH": "/path/to/warden/warden.db" }
+      "env": {
+        "WARDEN_DB_PATH": "/path/to/warden/warden.db",
+        "WARDEN_AGENT_NAME": "procurement-agent"
+      }
     }
   }
 }
@@ -107,7 +120,12 @@ against the real Stripe sandbox (never CI), mirroring `scripts/e2e-real.mjs` for
 | `@warden/cli` | `warden auth` (interactive login) |
 | `apps/web` | receipts dashboard (Vite + React) |
 
-Full technical spec: [SPEC.md](./SPEC.md). Built in public for Ship Season 2026, shipping
-Aug 16. Framing note: Warden is guardrails + receipts, not fraud detection and not
-"unhackable" — dollar caps are network-enforced; merchant/category rules are enforced
-deterministically at issuance with blast radius bounded by single-use cards.
+Full technical spec: [SPEC.md](./SPEC.md). Warden is an authority, control, and evidence
+layer—not fraud detection and not an “unhackable” payment network. The current local operator
+identity and SHA-256 evidence chain are suitable for an MVP/demo; production deployments
+should add organizational authentication, managed signing keys, multi-tenant isolation,
+webhook-first settlement, idempotent/recoverable rail provisioning, and external evidence
+anchoring.
+
+Investor preparation: [VC meeting brief](./docs/VC_MEETING_BRIEF.md) ·
+[five-minute demo runbook](./docs/VC_DEMO_RUNBOOK.md)

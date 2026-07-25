@@ -36,7 +36,7 @@ export function createWardenMcpServer(service: WardenService): McpServer {
     'warden_start_task',
     {
       description:
-        'Start a spend task for an agent. Requires the intent (the human goal/prompt that triggered this task); returns a budget envelope. No card is minted here.',
+        'Compatibility-only self-declared task flow. Disabled unless the operator explicitly sets WARDEN_ALLOW_LEGACY_TASKS=true; new integrations should use warden_start_mandate_task.',
       inputSchema: {
         agent_name: z.string().min(1),
         intent: z.string().min(1),
@@ -44,6 +44,28 @@ export function createWardenMcpServer(service: WardenService): McpServer {
       },
     },
     async (args) => run(() => service.startTask(args)),
+  );
+
+  server.registerTool(
+    'warden_list_my_mandates',
+    {
+      description:
+        'List active operator-approved mandates delegated to the agent identity bound to this MCP process. Use this to discover authority without copying IDs into prompts.',
+      inputSchema: {},
+    },
+    async () => run(() => service.listMyMandates()),
+  );
+
+  server.registerTool(
+    'warden_start_mandate_task',
+    {
+      description:
+        'Load an active operator-approved spend mandate for the agent identity bound to this MCP process. Returns its task, exact payee, remaining authority, expiry, and policy summary. The agent cannot self-declare either identity or terms.',
+      inputSchema: {
+        mandate_id: z.string().min(1),
+      },
+    },
+    async (args) => run(() => service.startMandateTask(args)),
   );
 
   server.registerTool(
@@ -57,6 +79,11 @@ export function createWardenMcpServer(service: WardenService): McpServer {
         merchant: z.string().optional(),
         category: z.string().optional(),
         rail: z.enum(['agentcard', 'stripe']).optional(),
+        idempotency_key: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('Required for mandate tasks; reuse the same key when retrying the same checkout.'),
       },
     },
     async (args) => run(() => service.issueCard(args)),
@@ -66,7 +93,7 @@ export function createWardenMcpServer(service: WardenService): McpServer {
     'warden_precheck_purchase',
     {
       description:
-        'Advisory-only check: would this purchase be allowed under the active policy right now? Never mints a card or changes state; useful for an agent to sanity-check before spending effort on a purchase flow.',
+        'Advisory-only check against both the operator mandate and active policy. Never mints a card or reserves authority.',
       inputSchema: {
         task_id: z.string().min(1),
         merchant: z.string().min(1),
@@ -91,7 +118,7 @@ export function createWardenMcpServer(service: WardenService): McpServer {
     'warden_complete_task',
     {
       description:
-        'Complete a task: closes all still-open cards upstream, releases unused budget, returns totals.',
+        'Complete a legacy task. Mandate tasks are controlled by the operator and remain open until revoked, expired, or exhausted.',
       inputSchema: { task_id: z.string().min(1) },
     },
     async (args) => run(() => service.completeTask(args)),

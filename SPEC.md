@@ -1,7 +1,14 @@
 # Warden — Technical Specification (SPEC.md)
 
-**Version:** 1.3 · 2026-07-24
-**Status:** Source of truth for implementation. A coding model (Codex) should be able to start at Task T1 and proceed strictly in order without further clarification.
+**Version:** 2.0 · 2026-07-24
+**Status:** Source of truth for the mandate-first local MVP. The original T1–T22 roadmap is
+retained below as implementation history; `STATUS.md` and `docs/VC_MEETING_BRIEF.md` define
+the current product and next milestones.
+**Changelog v2.0:** Product center moved from self-declared task budgets to
+operator-approved spend mandates. Added immutable mandate lifecycle, process-bound agent
+identity, agent-scoped discovery, atomic/idempotent authorizations, cumulative settlement
+true-up, verified hash-linked evidence, mandate REST APIs, and the new operator dashboard.
+The self-declared task flow is compatibility-only and disabled by default.
 **Changelog v1.3:** Multi-rail pivot. §2.7 renamed to cover the upstream boundary generally; a second `UpstreamClient` implementation (`packages/upstream-stripe`, Stripe Issuing test mode) is added alongside AgentCard. `cards.rail` column added. This was a deliberate scope change made under time pressure ahead of an investor demo — see §2.4 item 7 and the new §2.8 for the rationale and what changed vs. what stayed true.
 **Changelog v1.2:** Ship Season is a 6-week season ending Aug 16, 2026 (not 12 weeks). Roadmap phases remapped to the 6-week calendar; task order unchanged. T17 (categorization + budgets) downgraded to stretch goal.
 **Changelog v1.1:** Upstream auth rewritten for OAuth 2.0 + PKCE (verified: static bearer headers are rejected; access tokens live ~5 minutes). Card lifecycle changed from card-per-task to card-per-purchase (verified: upstream cards are $1–$50, auto-cancel after one authorized payment, expire after 7 days unused). Sandbox is a per-call flag. Added mock upstream server so implementation and CI never require live credentials.
@@ -11,7 +18,16 @@
 
 ## 1. Executive Summary
 
-Warden is a spend-guardrails and audit-receipts layer for AI agents that pay with virtual cards, built on top of the AgentCard MCP server. It enforces human-set spending policy deterministically by minting purpose-scoped single-use cards whose limits are applied at the card network (non-bypassable by the agent), and it binds every resulting charge to the agent's triggering intent, producing an explainable receipt log that aligns with the record-retention duties in the 2026 card-network agentic-commerce rules. It is positioned as the agent-side implementation of intent capture and audit — not as fraud detection or security tooling — for developers who run agents that spend money.
+Warden is the operator authority and evidence control plane for AI-agent spending. A human
+creates an immutable mandate naming the delegated agent, purpose, exact payee, cumulative
+budget, per-purchase ceiling, use count, rail, and expiry. The bound agent discovers only its
+own active mandates; Warden atomically reserves authority before provisioning a single-use
+credential and records rail outcomes in a recomputed, hash-linked evidence chain.
+
+Warden is rail-neutral and non-custodial. The current card rails enforce amount ceilings.
+Payee intent is checked before credential issuance and verified against the rail-observed
+merchant at settlement; network-level payee enforcement depends on rail capability and is a
+production milestone, not a claim of this MVP.
 
 ## 2. Technical Architecture
 
@@ -78,9 +94,15 @@ warden/
 
 ### 2.4 Core design patterns (agreed in brainstorm, revised v1.1)
 
-1. **Network-level enforcement, software-level advice.** Hard limits live on the card itself: the policy engine's output is the *parameter set passed to `create_card`* (amount cap in cents; upstream enforces single-authorization and 7-day expiry). Software pre-checks may decline earlier for better error messages, but the card is always the real gate. A compromised or prompt-injected agent that bypasses Warden's checks still hits the network decline.
-2. **One single-use card per purchase; task = budget envelope.** Upstream cards auto-cancel after one authorized payment and are capped at $50, so the natural unit is card-per-purchase. A Warden *task* carries the intent and a cumulative budget; each purchase inside it mints a fresh scoped card via `warden_issue_card`. Warden's deterministic gate is at issuance: it refuses to mint when the cumulative task budget, policy caps, or velocity limits would be exceeded. Blast radius of any single leaked credential = one card ≤ $50 ≤ remaining budget.
-3. **Intent binding at the boundary.** Every Warden MCP tool that can lead to spend requires an `intent` string (the goal/prompt that triggered the task). Receipts are the join: `transaction → card → task → intent → policy decision`.
+1. **Authority before execution.** The operator, not the model, defines identity and spend
+   terms. Activated mandates are immutable and end only through exhaustion, revocation, or
+   expiry. `WARDEN_AGENT_NAME` binds an MCP process to one delegated identity.
+2. **Atomic authorization.** Each checkout requires a mandate task, exact merchant,
+   idempotency key, amount, and rail. SQLite conditionally reserves both cumulative budget and
+   use count before an external card call, preventing retry and concurrency overspend.
+3. **One bounded credential per authorization.** The credential amount is enforced by the
+   selected rail. AgentCard natively single-uses cards; Stripe cards are canceled
+   operationally after authorization while pending captures remain reconciled.
 4. **Deterministic policy only.** The enforcement path contains no LLM/ML calls and no network calls other than to the upstream agent-cards MCP. Same inputs always produce the same decision. (Categorization for analytics may be heuristic, but it never gates a payment.)
 5. **Append-only audit.** Receipts and policy events are never updated or deleted, matching Visa Rules §4.1.24 record-retention framing (consent/instruction records producible on request). Corrections are new rows.
 6. **Money as integer cents, time as UTC ISO 8601.** Everywhere, no exceptions.
@@ -98,8 +120,22 @@ policies      id TEXT PK · agent_id TEXT NULL FK→agents (NULL = global defaul
 tasks         id TEXT PK · agent_id TEXT FK · intent TEXT NOT NULL
               status TEXT ('active'|'completed'|'expired'|'halted')
               budget_cents INTEGER · spent_cents INTEGER DEFAULT 0 · policy_id TEXT FK
-              created_at TEXT · closed_at TEXT NULL
+              mandate_id TEXT NULL (logical link to mandates) · created_at TEXT · closed_at TEXT NULL
               -- a task has 0..N cards (cards.task_id); no card_id column here
+
+mandates      id TEXT PK · agent_id TEXT FK · task_id TEXT NULL · purpose TEXT
+              merchant TEXT · status TEXT ('draft'|'active'|'exhausted'|'revoked'|'expired')
+              amount_limit_cents INTEGER · per_transaction_limit_cents INTEGER
+              max_transactions INTEGER · transaction_count INTEGER
+              reserved_cents INTEGER · settled_cents INTEGER · rail TEXT
+              policy_id TEXT · policy_snapshot_hash TEXT · mandate_hash TEXT
+              created_by TEXT · approved_by TEXT · lifecycle timestamps/reason
+
+authorizations id TEXT PK · mandate_id TEXT FK · task_id TEXT FK
+               idempotency_key TEXT · request_hash TEXT · amount_cents INTEGER
+               merchant TEXT · category TEXT · rail TEXT
+               status TEXT ('reserved'|'card_issued'|'released'|'settled')
+               settled_cents INTEGER · card_id TEXT NULL · timestamps
 
 cards         id TEXT PK (upstream card_id, verbatim) · task_id TEXT FK
               amount_cents INTEGER · merchant_hint TEXT NULL · sandbox INTEGER (0/1)
@@ -115,6 +151,12 @@ transactions  id TEXT PK (AgentCard txn id, verbatim) · card_id TEXT FK
 receipts      id TEXT PK · transaction_id TEXT UNIQUE FK · task_id TEXT FK
               intent TEXT · policy_id TEXT · decision_json TEXT · created_at TEXT
               -- APPEND-ONLY: no UPDATE/DELETE paths in code
+
+evidence      id TEXT PK · receipt_id TEXT FK · mandate_id TEXT FK
+              authorization_id TEXT NULL FK · transaction_id TEXT · event_key TEXT UNIQUE
+              outcome TEXT · sequence INTEGER · payload_json TEXT
+              previous_hash TEXT NULL · evidence_hash TEXT UNIQUE · created_at TEXT
+              -- APPEND-ONLY; the complete envelope and display facts are rehashed on read
 
 policy_events id TEXT PK · type TEXT ('block'|'circuit_break'|'approval_required'|
               'approved'|'denied'|'card_issued'|'card_closed')
@@ -177,53 +219,46 @@ type PolicyRules = {
 All tool args and results are zod-validated. Errors return MCP tool errors with machine-readable `code` values: `POLICY_BLOCKED`, `APPROVAL_REQUIRED`, `APPROVAL_PENDING`, `TASK_NOT_ACTIVE`, `BUDGET_EXCEEDED`, `CIRCUIT_OPEN`, `UPSTREAM_ERROR`, `UPSTREAM_AUTH_REQUIRED`.
 
 ```
-warden_start_task
-  in : { agent_name: string, intent: string, budget_cents?: number }
-  out: { task_id, budget_cents, policy_summary: string }
-  behavior: resolve agent (create if new) → load active policy → budget = min(requested,
-            per_task_budget_cents) → persist task. NO card is minted here.
+warden_list_my_mandates
+  in : {}
+  out: { agent, mandates: Array<{mandate_id, purpose, merchant,
+         amount_available_cents, per_transaction_limit_cents,
+         transactions_remaining, expires_at, rail}> }
+  behavior: identity comes only from WARDEN_AGENT_NAME; return active mandates for that
+            persisted agent and expire overdue authority before returning
+
+warden_start_mandate_task
+  in : { mandate_id: string }
+  out: { mandate_id, task_id, merchant, amount_available_cents, expires_at,
+         policy_summary }
+  behavior: require active mandate + matching process-bound agent identity; no authority
+            terms come from the tool caller
 
 warden_issue_card
   in : { task_id: string, amount_cents: number, merchant?: string, category?: string,
-         rail?: 'agentcard' | 'stripe' }   // v1.3, defaults to policy.default_rail
+         rail?: 'agentcard' | 'stripe', idempotency_key?: string }
   out: { card_id, amount_cents, single_use: true, expires: '7d-unused', rail }
-  behavior: task must be 'active' → evaluateIssue (per-card cap incl. upstream $1–$50 clamp,
-            merchant/category lists, per-merchant caps, remaining task budget, velocity,
-            circuit state) → if amount > approval_threshold: create approval, error
-            APPROVAL_REQUIRED with approval_id → upstream create_card({amount_cents,
-            sandbox: WARDEN_MODE !== 'live'}) → persist card, increment task.spent_cents
-            reservation → policy_event card_issued
+  mandate behavior: require matching process identity, exact merchant, active/unexpired
+            mandate, required idempotency key, allowed rail, per-use limit, cumulative
+            budget, and remaining use count → atomically reserve → provision card → bind
+            authorization. Same-key retries return the same card after binding and never
+            double reserve.
 
 warden_get_card_details
   in : { card_id: string }
   out: passthrough of upstream get_card_details (PAN/CVV/expiry, in-memory only)
-  guard: card must belong to an 'active' task and be 'open'; never persisted or logged
-
-warden_complete_task
-  in : { task_id: string }
-  out: { task_id, status: 'completed', cards_issued: number, receipts_count: number,
-         total_spent_cents: number }
-  behavior: upstream close_card for every still-'open' card → mark task completed
-            → policy_event card_closed per card → one immediate reconcile pass
+  guard: card must be open, mandate active/unexpired, and process identity must match;
+         credentials are never persisted or logged
 
 warden_precheck_purchase
   in : { task_id: string, merchant: string, amount_cents: number, category?: string }
   out: { decision: 'allow'|'block'|'needs_approval', reasons: string[] }
-  behavior: advisory-only deterministic evaluation (never mutates state except policy_event on block)
+  behavior: advisory deterministic evaluation across both mandate terms and policy
 
-warden_request_approval
-  in : { task_id: string, merchant: string, amount_cents: number, reason: string }
-  out: { approval_id, status: 'pending' }
-
-warden_check_approval
-  in : { approval_id: string }
-  out: { approval_id, status: 'pending'|'approved'|'denied'|'expired',
-         card_id?: string }   // on 'approved': a fresh scoped card minted for the approved amount
-
-warden_get_receipts
-  in : { task_id?: string, agent_name?: string, limit?: number (default 50) }
-  out: { receipts: Array<{id, intent, merchant, amount_cents, category, card_id, occurred_at,
-         decision_summary: string}> }
+warden_start_task / warden_complete_task
+  compatibility-only self-declared lifecycle; disabled unless
+  WARDEN_ALLOW_LEGACY_TASKS=true. complete_task is rejected for mandate tasks because their
+  lifecycle remains under operator control.
 ```
 
 Pass-through tools (proxied verbatim to upstream, read-only): `check_balance`, `list_cards`. Checkout mechanics (`buy`, `pay_checkout`, `fill_card`, `detect_checkout`, wallet funding, KYC) are **not** proxied — the agent calls agent-cards directly for those using the card Warden minted. Warden's control point is card issuance and closure, not checkout.
@@ -269,25 +304,41 @@ Auth: `Authorization: Bearer ${WARDEN_API_TOKEN}` on every route except `GET /he
 
 ```
 GET  /healthz                          → { ok: true, mode: 'test'|'live', upstream_auth: 'ok'|'needs_login' }
+POST /api/v1/mandates                  → create draft or create-and-activate operator authority
+GET  /api/v1/mandates?status=          → mandate registry
+GET  /api/v1/mandates/:id              → mandate details
+POST /api/v1/mandates/:id/activate     → activate an immutable draft
+POST /api/v1/mandates/:id/revoke       → body {reason}; close authority
+GET  /api/v1/evidence?mandate=&limit=  → sealed outcomes + global chain verification result
 GET  /api/v1/receipts?agent=&task=&limit=&cursor=   → paginated receipts (newest first)
 GET  /api/v1/receipts/:id              → single receipt incl. full decision_json + intent
-GET  /api/v1/receipts/export           → NDJSON stream of all receipts (audit export)
 GET  /api/v1/agents                    → agents with rollup {total_spent_cents, receipts, blocks}
 GET  /api/v1/policies?agent=           → active policy (+ version history)
 PUT  /api/v1/policies                  → body {agent_name|null, rules: PolicyRules};
                                           creates NEW version, activates it (never mutates old)
-GET  /api/v1/approvals?status=pending  → approval queue
-POST /api/v1/approvals/:id/decision    → body {decision:'approved'|'denied', decided_by: string}
 GET  /api/v1/events?type=&limit=       → policy_events feed
 GET  /api/v1/stats                     → { spend_under_management_cents, receipts_total,
-                                           blocks_total, avg_blast_radius_cents }
+                                           blocks_total, avg_blast_radius_cents,
+                                           active_mandates, authority_available_cents,
+                                           evidence_total }
 ```
 
 `4xx` errors: `{ error: { code: string, message: string } }`. All list endpoints use cursor pagination (`?cursor=<id>`).
 
 ### 3.4 Reconciler contract (`packages/mcp`, background loop)
 
-- Every `RECONCILE_INTERVAL_MS` (default 30 000): for each non-`closed` card, call upstream `list_transactions(card_id)`; insert unseen transactions (idempotent on txn id); create one receipt per new non-DECLINED transaction joining the task's intent and the policy decision snapshot; update `tasks.spent_cents` from settled amounts; mark cards `used` when their single authorization settles.
+- Every `RECONCILE_INTERVAL_MS` (default 30 000): for each `open` or `used` card, call the
+  issuing rail's `listTransactions`; ingest transaction status changes idempotently and append
+  evidence for each mandate lifecycle event.
+- Settlement is a card-wide cumulative true-up against `authorizations.settled_cents`, so
+  multiple captures and concurrent reconciliation cannot omit or double-count spend.
+- Revoked/expired authority closes upstream credentials, performs a final transaction read,
+  preserves pending captures in the poll set, and never overwrites the operator's terminal
+  state when a late settlement arrives.
+- Stripe authorization and capture object IDs are normalized into one logical transaction
+  lifecycle (`PENDING` → `SETTLED`) while preserving the native capture in raw evidence.
+- Evidence seals identifiers, outcome, timestamp, previous link, and a snapshot containing
+  mandate/agent/authorization/transaction display facts. The API recomputes the chain on read.
 - DECLINED transactions do not create receipts; they create a `block` policy_event annotated `enforced_at: 'network'` — these are the demo-critical "the card said no" moments.
 - After each pass, run `evaluateCircuit` per agent — if open, close all that agent's open cards, mark its active tasks `halted`, write `circuit_break` event.
 - Cards `open` past `card_ttl_minutes` are closed upstream and marked `expired` locally (upstream would do it at 7 days; Warden tightens it).

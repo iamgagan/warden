@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { PolicyRulesSchema } from '@warden/core';
-import type { PolicyRow, Repo } from '@warden/db';
+import type { EvidenceListItem, EvidenceRow, MandateRow, PolicyRow, Repo } from '@warden/db';
 
 export interface UpstreamAuthStatus {
   upstream_auth: 'ok' | 'needs_login';
@@ -13,6 +13,8 @@ export interface ApiOptions {
   mode: 'test' | 'live';
   /** Live reconciler status object (shared reference, read on demand). */
   reconcilerStatus?: UpstreamAuthStatus;
+  /** Display attribution for approvals made through this local operator API. */
+  operatorName?: string;
 }
 
 const apiError = (code: string, message: string) => ({ error: { code, message } });
@@ -38,6 +40,44 @@ const putPolicyBody = z.object({
   rules: PolicyRulesSchema,
 });
 
+const mandateBody = z
+  .object({
+    agent_name: z.string().trim().min(1).max(120),
+    purpose: z.string().trim().min(3).max(500),
+    merchant: z.string().trim().min(1).max(160),
+    amount_limit_cents: z.number().int().positive().max(100_000_000),
+    per_transaction_limit_cents: z.number().int().positive().max(100_000_000).optional(),
+    max_transactions: z.number().int().min(1).max(10_000).default(1),
+    expires_at: z.string().datetime(),
+    rail: z.enum(['auto', 'agentcard', 'stripe']).default('auto'),
+    activate_now: z.boolean().default(true),
+  })
+  .superRefine((value, ctx) => {
+    if (new Date(value.expires_at).getTime() <= Date.now()) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['expires_at'],
+        message: 'expiry must be in the future',
+      });
+    }
+    if (
+      value.per_transaction_limit_cents !== undefined &&
+      value.per_transaction_limit_cents > value.amount_limit_cents
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['per_transaction_limit_cents'],
+        message: 'per-transaction limit cannot exceed the total budget',
+      });
+    }
+  });
+
+const revokeMandateBody = z.object({ reason: z.string().trim().min(1).max(300) });
+const evidenceQuery = z.object({
+  mandate: z.string().optional(),
+  limit: z.coerce.number().int().min(1).max(500).default(100),
+});
+
 /** SPEC §3.3 — read paths (T9). Bearer auth on everything except /healthz. */
 export function createApiApp(opts: ApiOptions): Hono {
   const { repo } = opts;
@@ -59,6 +99,85 @@ export function createApiApp(opts: ApiOptions): Hono {
     await next();
   });
 
+  app.post('/api/v1/mandates', async (c) => {
+    const body = await c.req.json().catch(() => null);
+    const parsed = mandateBody.safeParse(body);
+    if (!parsed.success) return c.json(apiError('BAD_REQUEST', parsed.error.message), 400);
+    const input = parsed.data;
+    const agent = repo.getOrCreateAgent(input.agent_name);
+    let mandate = repo.createMandate({
+      agentId: agent.id,
+      purpose: input.purpose,
+      merchant: input.merchant,
+      amountLimitCents: input.amount_limit_cents,
+      perTransactionLimitCents:
+        input.per_transaction_limit_cents ?? input.amount_limit_cents,
+      maxTransactions: input.max_transactions,
+      expiresAt: input.expires_at,
+      rail: input.rail,
+      createdBy: opts.operatorName ?? 'Local operator',
+    });
+    if (input.activate_now) {
+      mandate = repo.activateMandate(mandate.id, opts.operatorName ?? 'Local operator');
+    }
+    return c.json({ mandate: mandateJson(mandate, agent.name) }, 201);
+  });
+
+  app.get('/api/v1/mandates', (c) => {
+    const status = c.req.query('status');
+    const allowed = ['draft', 'active', 'exhausted', 'revoked', 'expired'] as const;
+    if (status && !(allowed as readonly string[]).includes(status)) {
+      return c.json(apiError('BAD_REQUEST', 'invalid mandate status'), 400);
+    }
+    const items = repo.listMandates(status as MandateRow['status'] | undefined);
+    return c.json({
+      mandates: items.map((mandate) =>
+        mandateJson(mandate, repo.listAgents().find((agent) => agent.id === mandate.agentId)?.name ?? 'Unknown'),
+      ),
+    });
+  });
+
+  app.get('/api/v1/mandates/:id', (c) => {
+    const mandate = repo.getMandate(c.req.param('id'));
+    if (!mandate) return c.json(apiError('NOT_FOUND', 'no such mandate'), 404);
+    const agent = repo.listAgents().find((item) => item.id === mandate.agentId);
+    return c.json({ mandate: mandateJson(mandate, agent?.name ?? 'Unknown') });
+  });
+
+  app.post('/api/v1/mandates/:id/activate', (c) => {
+    try {
+      const mandate = repo.activateMandate(
+        c.req.param('id'),
+        opts.operatorName ?? 'Local operator',
+      );
+      const agent = repo.listAgents().find((item) => item.id === mandate.agentId);
+      return c.json({ mandate: mandateJson(mandate, agent?.name ?? 'Unknown') });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const status = message.startsWith('unknown mandate') ? 404 : 409;
+      return c.json(apiError(status === 404 ? 'NOT_FOUND' : 'INVALID_STATE', message), status);
+    }
+  });
+
+  app.post('/api/v1/mandates/:id/revoke', async (c) => {
+    const body = await c.req.json().catch(() => null);
+    const parsed = revokeMandateBody.safeParse(body);
+    if (!parsed.success) return c.json(apiError('BAD_REQUEST', parsed.error.message), 400);
+    try {
+      const mandate = repo.revokeMandate(
+        c.req.param('id'),
+        parsed.data.reason,
+        opts.operatorName ?? 'Local operator',
+      );
+      const agent = repo.listAgents().find((item) => item.id === mandate.agentId);
+      return c.json({ mandate: mandateJson(mandate, agent?.name ?? 'Unknown') });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const status = message.startsWith('unknown mandate') ? 404 : 409;
+      return c.json(apiError(status === 404 ? 'NOT_FOUND' : 'INVALID_STATE', message), status);
+    }
+  });
+
   app.get('/api/v1/receipts', (c) => {
     const parsed = listQuery.safeParse(c.req.query());
     if (!parsed.success) return c.json(apiError('BAD_REQUEST', parsed.error.message), 400);
@@ -71,7 +190,9 @@ export function createApiApp(opts: ApiOptions): Hono {
     }
     const items = repo.listReceipts({ agentId, taskId: task, limit, cursor });
     return c.json({
-      receipts: items.map(receiptJson),
+      receipts: items.map((receipt) =>
+        receiptJson(receipt, repo.getEvidenceByReceipt(receipt.id)),
+      ),
       next_cursor: items.length === limit ? items[items.length - 1]!.id : null,
     });
   });
@@ -80,8 +201,29 @@ export function createApiApp(opts: ApiOptions): Hono {
     const receipt = repo.getReceipt(c.req.param('id'));
     if (!receipt) return c.json(apiError('NOT_FOUND', 'no such receipt'), 404);
     return c.json({
-      ...receiptJson(receipt),
+      ...receiptJson(receipt, repo.getEvidenceByReceipt(receipt.id)),
       decision: JSON.parse(receipt.decisionJson),
+    });
+  });
+
+  app.get('/api/v1/evidence', (c) => {
+    const parsed = evidenceQuery.safeParse(c.req.query());
+    if (!parsed.success) return c.json(apiError('BAD_REQUEST', parsed.error.message), 400);
+    if (parsed.data.mandate && !repo.getMandate(parsed.data.mandate)) {
+      return c.json(apiError('NOT_FOUND', 'no such mandate'), 404);
+    }
+    const items = repo.listEvidence({
+      mandateId: parsed.data.mandate,
+      limit: parsed.data.limit,
+    });
+    const verification = repo.verifyEvidenceChain();
+    return c.json({
+      evidence: items.map((row) => evidenceJson(row, verification.valid)),
+      chain_verification: {
+        verified: verification.valid,
+        checked_records: verification.checkedRecords,
+        first_invalid_sequence: verification.firstInvalidSequence,
+      },
     });
   });
 
@@ -145,17 +287,58 @@ export function createApiApp(opts: ApiOptions): Hono {
 
   app.get('/api/v1/stats', (c) => {
     const s = repo.stats();
+    const mandates = repo.listMandates();
+    const activeMandates = mandates.filter((mandate) => mandate.status === 'active');
     return c.json({
       spend_under_management_cents: s.spendUnderManagementCents,
       receipts_total: s.receiptsTotal,
       blocks_total: s.blocksTotal,
       avg_blast_radius_cents: s.avgBlastRadiusCents,
+      active_mandates: activeMandates.length,
+      authority_available_cents: activeMandates.reduce(
+        (sum, mandate) =>
+          sum + mandate.amountLimitCents - mandate.reservedCents - mandate.settledCents,
+        0,
+      ),
+      evidence_total: repo.listEvidence({ limit: 10_000 }).length,
     });
   });
 
   app.notFound((c) => c.json(apiError('NOT_FOUND', 'no such route'), 404));
 
   return app;
+}
+
+function mandateJson(row: MandateRow, agentName: string) {
+  const available = Math.max(0, row.amountLimitCents - row.reservedCents - row.settledCents);
+  return {
+    id: row.id,
+    status: row.status,
+    agent_id: row.agentId,
+    agent: agentName,
+    task_id: row.taskId,
+    purpose: row.purpose,
+    merchant: row.merchant,
+    currency: row.currency,
+    amount_limit_cents: row.amountLimitCents,
+    per_transaction_limit_cents: row.perTransactionLimitCents,
+    max_transactions: row.maxTransactions,
+    transaction_count: row.transactionCount,
+    reserved_cents: row.reservedCents,
+    settled_cents: row.settledCents,
+    amount_available_cents: available,
+    rail: row.rail,
+    policy_id: row.policyId,
+    policy_snapshot_hash: row.policySnapshotHash,
+    mandate_hash: row.mandateHash,
+    approved_by: row.approvedBy,
+    created_at: row.createdAt,
+    activated_at: row.activatedAt,
+    expires_at: row.expiresAt,
+    closed_at: row.closedAt,
+    close_reason: row.closeReason,
+    summary: `${agentName} may spend up to $${(row.amountLimitCents / 100).toFixed(2)} at ${row.merchant} for “${row.purpose}” before ${new Date(row.expiresAt).toLocaleDateString('en-US')}.`,
+  };
 }
 
 function receiptJson(r: {
@@ -174,7 +357,7 @@ function receiptJson(r: {
   transactionStatus: string;
   decisionJson: string;
   rail: string;
-}) {
+}, evidence?: EvidenceRow) {
   const decision = JSON.parse(r.decisionJson) as Record<string, unknown>;
   return {
     id: r.id,
@@ -192,6 +375,58 @@ function receiptJson(r: {
     occurred_at: r.occurredAt,
     created_at: r.createdAt,
     decision_summary: summarizeDecision(decision),
+    mandate_id: evidence?.mandateId ?? null,
+    evidence_hash: evidence?.evidenceHash ?? null,
+    evidence_outcome: evidence?.outcome ?? null,
+  };
+}
+
+function evidenceJson(row: EvidenceListItem, chainVerified: boolean) {
+  const payload = JSON.parse(row.payloadJson) as {
+    decision?: string;
+    checks?: unknown[];
+    mandate?: Record<string, unknown>;
+    authorization?: Record<string, unknown> | null;
+    transaction?: Record<string, unknown>;
+  };
+  const mandate = payload.mandate ?? {};
+  const transaction = payload.transaction ?? {};
+  const hasSealedDisplayFacts =
+    typeof mandate['purpose'] === 'string' &&
+    typeof mandate['agent_name'] === 'string' &&
+    typeof transaction['merchant'] === 'string' &&
+    typeof transaction['amount_cents'] === 'number' &&
+    typeof transaction['currency'] === 'string';
+  return {
+    id: row.id,
+    receipt_id: row.receiptId,
+    mandate_id: row.mandateId,
+    authorization_id: row.authorizationId,
+    transaction_id: row.transactionId,
+    outcome: row.outcome,
+    decision: payload.decision ?? 'unknown',
+    checks: payload.checks ?? [],
+    mandate,
+    authorization: payload.authorization ?? null,
+    transaction,
+    merchant:
+      typeof transaction['merchant'] === 'string' ? transaction['merchant'] : row.merchant,
+    amount_cents:
+      typeof transaction['amount_cents'] === 'number'
+        ? transaction['amount_cents']
+        : row.amountCents,
+    currency:
+      typeof transaction['currency'] === 'string' ? transaction['currency'] : row.currency,
+    agent: typeof mandate['agent_name'] === 'string' ? mandate['agent_name'] : row.agentName,
+    purpose: typeof mandate['purpose'] === 'string' ? mandate['purpose'] : row.purpose,
+    integrity: {
+      kind: 'sha256_chain_v1',
+      sequence: row.sequence,
+      evidence_hash: row.evidenceHash,
+      previous_hash: row.previousHash,
+      verified: chainVerified && hasSealedDisplayFacts,
+    },
+    created_at: row.createdAt,
   };
 }
 

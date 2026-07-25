@@ -192,6 +192,22 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       ALTER TABLE authorizations ADD COLUMN settled_cents INTEGER NOT NULL DEFAULT 0;
     `,
   },
+  {
+    id: '0005_evidence_append_only',
+    sql: `
+      CREATE TRIGGER evidence_no_update
+      BEFORE UPDATE ON evidence
+      BEGIN
+        SELECT RAISE(ABORT, 'evidence is append-only');
+      END;
+
+      CREATE TRIGGER evidence_no_delete
+      BEFORE DELETE ON evidence
+      BEGIN
+        SELECT RAISE(ABORT, 'evidence is append-only');
+      END;
+    `,
+  },
 ];
 
 export function migrate(sqlite: Database): void {

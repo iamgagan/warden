@@ -115,6 +115,25 @@ export function createWardenMcpServer(service: WardenService): McpServer {
   );
 
   server.registerTool(
+    'warden_list_cards',
+    {
+      description:
+        'List cards from the configured payment rails (read-only pass-through; credentials are never included).',
+      inputSchema: {},
+    },
+    async () => run(() => service.listCards()),
+  );
+
+  server.registerTool(
+    'warden_check_balance',
+    {
+      description: 'Read the remaining balance for a Warden-issued card from its payment rail.',
+      inputSchema: { card_id: z.string().min(1) },
+    },
+    async (args) => run(() => service.checkBalance(args)),
+  );
+
+  server.registerTool(
     'warden_complete_task',
     {
       description:

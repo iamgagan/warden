@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { PolicyRulesSchema } from '@warden/core';
 import { openWardenDb, type WardenDb } from '@warden/db';
 import { MockUpstream } from '@warden/mock-agentcard';
 import { UpstreamError, type UpstreamClient, type UpstreamTxn } from '@warden/upstream';
@@ -463,6 +464,57 @@ describe('Reconciler (T8 done-check)', () => {
     expect(db.repo.getCard(card_id)?.state).toBe('open'); // decline does not consume the card
   });
 
+  it('records a violation when rail-observed settlement does not match the mandate', async () => {
+    const agent = db.repo.getOrCreateAgent('procurement-agent');
+    const mandate = db.repo.activateMandate(
+      db.repo.createMandate({
+        agentId: agent.id,
+        purpose: 'Buy paper',
+        merchant: 'Staples',
+        amountLimitCents: 2000,
+        perTransactionLimitCents: 2000,
+        maxTransactions: 1,
+        expiresAt: futureExpiry(),
+        rail: 'agentcard',
+        createdBy: 'Local operator',
+      }).id,
+      'Local operator',
+    );
+    const card = await service.issueCard({
+      task_id: mandate.taskId!,
+      amount_cents: 1000,
+      merchant: 'Staples',
+      idempotency_key: 'mismatch-settlement',
+    });
+    upstream.simulatePurchase(card.card_id, {
+      merchant: 'UNAPPROVED GIFT CARDS',
+      amount_cents: 900,
+    });
+
+    await reconciler.runOnce();
+
+    const records = db.repo.listEvidence({ mandateId: mandate.id, limit: 10 });
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({ outcome: 'violation' });
+    const payload = JSON.parse(records[0]!.payloadJson);
+    expect(payload.decision).toBe('mismatch');
+    expect(payload.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code: 'PAYEE_MATCH', result: 'fail' }),
+      ]),
+    );
+    expect(
+      db.repo
+        .listPolicyEvents({ type: 'block', limit: 10 })
+        .map((event) => JSON.parse(event.detailsJson)),
+    ).toContainEqual(
+      expect.objectContaining({
+        enforced_at: 'evidence',
+        mandate_id: mandate.id,
+      }),
+    );
+  });
+
   it('complete_task runs an immediate pass so totals include fresh receipts', async () => {
     const { task_id } = service.startTask({ agent_name: 'shopper', intent: 'x' });
     const { card_id } = await service.issueCard({ task_id, amount_cents: 1500 });
@@ -496,6 +548,32 @@ describe('Reconciler (T8 done-check)', () => {
     await reconciler.runOnce();
     expect(reconciler.status.upstream_auth).toBe('ok');
     expect(reconciler.status.last_error).toBeNull();
+  });
+
+  it('closes unused cards after the configured credential TTL and releases exposure', async () => {
+    const agent = db.repo.getOrCreateAgent('shopper');
+    db.repo.setActivePolicy(
+      agent.id,
+      JSON.stringify(PolicyRulesSchema.parse({ card_ttl_minutes: 1 })),
+    );
+    const { task_id } = service.startTask({ agent_name: 'shopper', intent: 'x' });
+    const { card_id } = await service.issueCard({ task_id, amount_cents: 1000 });
+    db.sqlite
+      .prepare("UPDATE cards SET created_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
+      .run(card_id);
+
+    await reconciler.runOnce();
+
+    expect(db.repo.getCard(card_id)?.state).toBe('expired');
+    expect(db.repo.getTask(task_id)?.spentCents).toBe(0);
+    expect((await upstream.listCards())[0]?.state).toBe('closed');
+    expect(
+      db.repo
+        .listPolicyEvents({ type: 'card_closed', limit: 10 })
+        .map((event) => JSON.parse(event.detailsJson)),
+    ).toContainEqual(
+      expect.objectContaining({ card_id, reason: 'credential_ttl_expired' }),
+    );
   });
 
   it('survives per-card upstream errors and continues the pass', async () => {

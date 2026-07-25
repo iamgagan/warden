@@ -5,12 +5,14 @@ import {
   UPSTREAM_MIN_CARD_CENTS,
   evaluateIssue,
   evaluatePurchase,
+  normalizeMerchant,
   parsePolicyRules,
   type PolicyRules,
 } from '@warden/core';
 import type { Repo, TaskRow } from '@warden/db';
 import {
   UpstreamError,
+  type CardSummary,
   type CardCredentials,
   type Rail,
   type UpstreamClient,
@@ -37,6 +39,8 @@ export interface WardenServiceOptions {
    * so an agent cannot self-declare authority around the operator workflow.
    */
   allowLegacyTasks?: boolean;
+  /** Operational errors that need human attention. */
+  log?: (line: string) => void;
 }
 
 /**
@@ -51,6 +55,7 @@ export class WardenService {
   private readonly nowMs: () => number;
   private readonly actorAgentName: string | undefined;
   private readonly allowLegacyTasks: boolean;
+  private readonly log: (line: string) => void;
 
   constructor(opts: WardenServiceOptions) {
     this.repo = opts.repo;
@@ -60,6 +65,7 @@ export class WardenService {
     this.nowMs = opts.now ?? Date.now;
     this.actorAgentName = opts.actorAgentName;
     this.allowLegacyTasks = opts.allowLegacyTasks ?? false;
+    this.log = opts.log ?? ((line) => console.error(line));
   }
 
   get sandbox(): boolean {
@@ -216,7 +222,12 @@ export class WardenService {
             amount_available_cents:
               mandate.amountLimitCents - mandate.reservedCents - mandate.settledCents,
             per_transaction_limit_cents: mandate.perTransactionLimitCents,
-            transactions_remaining: mandate.maxTransactions - mandate.transactionCount,
+            transactions_remaining: Math.max(
+              0,
+              mandate.maxTransactions -
+                mandate.transactionCount -
+                this.repo.countOpenAuthorizations(mandate.id),
+            ),
             expires_at: mandate.expiresAt,
             rail: mandate.rail,
           }))
@@ -356,7 +367,7 @@ export class WardenService {
           JSON.stringify({
             taskId: task.id,
             amountCents: decision.card_amount_cents,
-            merchant: input.merchant.trim().toLocaleLowerCase(),
+            merchant: normalizeMerchant(input.merchant),
             category: input.category ?? null,
             rail,
           }),
@@ -436,6 +447,7 @@ export class WardenService {
       throw upstreamToolError(err);
     }
 
+    let cardPersisted = false;
     try {
       this.repo.insertCard({
         id: cardId,
@@ -445,14 +457,39 @@ export class WardenService {
         sandbox: this.sandbox,
         rail,
       });
-      if (authorizationId) this.repo.bindAuthorizationCard(authorizationId, cardId);
+      cardPersisted = true;
+      if (authorizationId && !this.repo.bindAuthorizationCard(authorizationId, cardId)) {
+        throw new Error(`authorization ${authorizationId} was no longer reservable`);
+      }
     } catch (err) {
-      if (authorizationId) this.repo.releaseAuthorization(authorizationId);
-      else this.repo.addTaskSpent(task.id, -decision.card_amount_cents);
       try {
         await this.upstreamFor(rail).closeCard(cardId);
-      } catch {
-        // The local failure is primary; reconciliation/TTL cleanup remains the safety net.
+        if (cardPersisted) this.repo.setCardState(cardId, 'closed');
+        if (authorizationId) this.repo.releaseAuthorization(authorizationId);
+        else this.repo.addTaskSpent(task.id, -decision.card_amount_cents);
+      } catch (closeError) {
+        // Keep authority reserved when the live rail artifact could not be
+        // closed. This fails closed against retries and double issuance.
+        this.log(
+          `[warden] CRITICAL orphan-risk card ${cardId}: local persistence failed and compensating close failed: ${String(closeError)}`,
+        );
+        try {
+          this.repo.insertPolicyEvent({
+            type: 'circuit_break',
+            taskId: task.id,
+            agentId: task.agentId,
+            detailsJson: JSON.stringify({
+              reason: 'card_persistence_and_close_failed',
+              card_id: cardId,
+              rail,
+              amount_cents: decision.card_amount_cents,
+              local_error: err instanceof Error ? err.message : String(err),
+              close_error: closeError instanceof Error ? closeError.message : String(closeError),
+            }),
+          });
+        } catch (eventError) {
+          this.log(`[warden] CRITICAL failed to persist orphan-risk event: ${String(eventError)}`);
+        }
       }
       throw err;
     }
@@ -520,7 +557,10 @@ export class WardenService {
         ) {
           mandateReasons.push('amount exceeds remaining mandate authority');
         }
-        if (mandate.transactionCount >= mandate.maxTransactions) {
+        if (
+          mandate.transactionCount + this.repo.countOpenAuthorizations(mandate.id) >=
+          mandate.maxTransactions
+        ) {
           mandateReasons.push('mandate transaction limit has been reached');
         }
       }
@@ -570,6 +610,27 @@ export class WardenService {
     } catch (err) {
       throw upstreamToolError(err);
     }
+  }
+
+  async listCards(): Promise<Array<CardSummary & { rail: Rail }>> {
+    const results = await Promise.all(
+      (Object.entries(this.upstreams) as Array<[Rail, UpstreamClient]>).map(
+        async ([rail, upstream]) =>
+          (await upstream.listCards()).map((card) => ({ ...card, rail })),
+      ),
+    );
+    return results.flat();
+  }
+
+  async checkBalance(input: { card_id: string }): Promise<{ balance_cents: number }> {
+    const card = this.repo.getCard(input.card_id);
+    if (!card) throw new WardenToolError('POLICY_BLOCKED', `unknown card ${input.card_id}`);
+    const task = this.repo.getTask(card.taskId);
+    if (!task) {
+      throw new WardenToolError('TASK_NOT_ACTIVE', `unknown task ${card.taskId}`);
+    }
+    this.assertMandateActor(task);
+    return this.upstreamFor(card.rail).checkBalance(card.id);
   }
 
   async completeTask(input: { task_id: string }): Promise<{
@@ -638,10 +699,6 @@ function mandateReason(reason: string): string {
     idempotency_conflict: 'the idempotency key was already used for a different request',
   };
   return reasons[reason] ?? reason;
-}
-
-function normalizeMerchant(value: string): string {
-  return value.normalize('NFKC').toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
 }
 
 function summarizePolicy(rules: PolicyRules, budgetCents: number): string {

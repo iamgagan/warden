@@ -6,6 +6,7 @@ export {
   evaluateCircuit,
   evaluateIssue,
   evaluatePurchase,
+  normalizeMerchant,
   parsePolicyRules,
   type CircuitState,
   type CircuitWindow,

@@ -37,7 +37,17 @@ export function parsePolicyRules(rulesJson: string): PolicyRules {
   return PolicyRulesSchema.parse(JSON.parse(rulesJson));
 }
 
-const norm = (s: string): string => s.trim().toLowerCase();
+const normalizeText = (value: string): string => value.trim().toLocaleLowerCase();
+
+/** Canonical merchant identity used by policy, reservation, replay, and settlement checks. */
+export function normalizeMerchant(value: string): string {
+  return value
+    .normalize('NFKC')
+    .trim()
+    .toLocaleLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim();
+}
 
 const clampToUpstream = (cents: number): number =>
   Math.max(UPSTREAM_MIN_CARD_CENTS, Math.min(UPSTREAM_MAX_CARD_CENTS, cents));
@@ -68,13 +78,13 @@ export function evaluateIssue(policy: PolicyRules, req: IssueRequest): IssueDeci
     reasons.push('amount_cents must be a positive integer');
   }
 
-  const merchant = req.merchant === undefined ? undefined : norm(req.merchant);
+  const merchant = req.merchant === undefined ? undefined : normalizeMerchant(req.merchant);
   if (merchant !== undefined) {
-    if (policy.blocked_merchants.some((m) => norm(m) === merchant)) {
+    if (policy.blocked_merchants.some((m) => normalizeMerchant(m) === merchant)) {
       reasons.push(`merchant "${req.merchant}" is on the blocked list`);
     } else if (
       policy.allowed_merchants.length > 0 &&
-      !policy.allowed_merchants.some((m) => norm(m) === merchant)
+      !policy.allowed_merchants.some((m) => normalizeMerchant(m) === merchant)
     ) {
       reasons.push(`merchant "${req.merchant}" is not on the allowed list`);
     }
@@ -83,7 +93,7 @@ export function evaluateIssue(policy: PolicyRules, req: IssueRequest): IssueDeci
   if (
     req.category !== undefined &&
     policy.allowed_categories.length > 0 &&
-    !policy.allowed_categories.some((c) => norm(c) === norm(req.category!))
+    !policy.allowed_categories.some((c) => normalizeText(c) === normalizeText(req.category!))
   ) {
     reasons.push(`category "${req.category}" is not on the allowed list`);
   }
@@ -100,7 +110,7 @@ export function evaluateIssue(policy: PolicyRules, req: IssueRequest): IssueDeci
 
   if (merchant !== undefined) {
     const merchantCapEntry = Object.entries(policy.per_merchant_caps).find(
-      ([name]) => norm(name) === merchant,
+      ([name]) => normalizeMerchant(name) === merchant,
     );
     if (merchantCapEntry && req.amount_cents > merchantCapEntry[1]) {
       reasons.push(

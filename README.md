@@ -60,6 +60,18 @@ Create and activate a mandate in the dashboard. The bound agent can then call
 
 ### Offline demo (no credentials needed)
 
+For the VC-ready proof console with a fresh deterministic dataset:
+
+```bash
+pnpm demo
+# open the printed URL; the token is applied automatically
+```
+
+This single command rebuilds the product, resets a demo-only database under
+`/private/tmp`, seeds approved settlements plus a prevented out-of-scope request,
+and starts the dashboard. The full mandate registry, evidence ledger, and policy
+editor remain available behind the proof-first overview.
+
 The demo drives the mandate-first workflow over stdio exactly like a real agent's MCP client
 (same identity binding, discovery, tools, and errors) against the in-process mock rail:
 

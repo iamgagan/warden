@@ -26,6 +26,18 @@ Expected result: the production build succeeds and all tests pass.
 
 ## Start the dashboard
 
+For the presentation-ready seeded proof console, use the one-command launcher:
+
+```bash
+pnpm demo
+```
+
+Open the URL printed in the terminal. It carries the local demo token in the URL
+fragment, then removes it after authentication. Use the proof console for the
+opening story and the rest of this runbook as the technical-diligence version.
+
+For the empty-to-live MCP walkthrough, start the dashboard manually:
+
 Choose a fresh path, for example:
 
 ```bash

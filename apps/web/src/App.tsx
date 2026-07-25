@@ -8,6 +8,7 @@ import {
   type Evidence,
   type Health,
   type Mandate,
+  type PolicyEvent,
   type PolicyRules,
   type PolicyVersion,
   type Receipt,
@@ -43,7 +44,8 @@ type IconName =
   | 'check'
   | 'clock'
   | 'merchant'
-  | 'agent';
+  | 'agent'
+  | 'search';
 
 function tokenFromHash(): string | null {
   const match = /[#&]token=([^&]+)/.exec(window.location.hash);
@@ -140,6 +142,7 @@ function ControlPlane({
   const [mandates, setMandates] = useState<Mandate[]>([]);
   const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [receipts, setReceipts] = useState<Receipt[]>([]);
+  const [events, setEvents] = useState<PolicyEvent[]>([]);
   const [selectedEvidence, setSelectedEvidence] = useState<Evidence | null>(null);
   const [creating, setCreating] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -147,19 +150,21 @@ function ControlPlane({
 
   const refresh = useCallback(async () => {
     try {
-      const [nextHealth, nextStats, nextMandates, nextEvidence, nextReceipts] =
+      const [nextHealth, nextStats, nextMandates, nextEvidence, nextReceipts, nextEvents] =
         await Promise.all([
           api.health(),
           api.stats(token),
           api.mandates(token),
           api.evidence(token),
           api.receipts(token),
+          api.events(token),
         ]);
       setHealth(nextHealth);
       setStats(nextStats);
       setMandates(nextMandates.mandates);
       setEvidence(nextEvidence.evidence);
       setReceipts(nextReceipts.receipts);
+      setEvents(nextEvents.events);
       setError(null);
     } catch (nextError) {
       if (nextError instanceof UnauthorizedError) onUnauthorized();
@@ -263,6 +268,8 @@ function ControlPlane({
                 stats={stats}
                 mandates={mandates}
                 evidence={evidence}
+                events={events}
+                health={health}
                 onNewMandate={() => setCreating(true)}
                 onOpenMandates={() => setView('mandates')}
                 onOpenEvidence={(item) => {
@@ -318,6 +325,8 @@ function Overview({
   stats,
   mandates,
   evidence,
+  events,
+  health,
   onNewMandate,
   onOpenMandates,
   onOpenEvidence,
@@ -325,16 +334,34 @@ function Overview({
   stats: Stats | null;
   mandates: Mandate[];
   evidence: Evidence[];
+  events: PolicyEvent[];
+  health: Health | null;
   onNewMandate: () => void;
   onOpenMandates: () => void;
   onOpenEvidence: (evidence: Evidence) => void;
 }) {
   const active = mandates.filter((mandate) => mandate.status === 'active');
   const featured = active[0];
+  const latestBlock = events.find(
+    (event) =>
+      event.type === 'block' &&
+      ['issuance', 'authorization', 'advisory'].includes(
+        String(event.details.enforced_at ?? ''),
+      ),
+  );
+  const hasDemoStory = health?.mode === 'test' && Boolean(evidence.length || latestBlock);
 
   return (
     <div className="view-stack enter">
-      <section className="hero-panel">
+      {hasDemoStory && (
+        <DemoProofConsole
+          mandates={mandates}
+          evidence={evidence}
+          block={latestBlock}
+          onOpenEvidence={onOpenEvidence}
+        />
+      )}
+      {!hasDemoStory && <section className="hero-panel">
         <div className="hero-copy">
           <span className="eyebrow accent">Authority layer for agent commerce</span>
           <h2>Every agent dollar starts with your decision.</h2>
@@ -357,7 +384,7 @@ function Overview({
           <LifecycleNode step="02" title="Authorize" detail="Atomic reservation" active={active.length > 0} />
           <LifecycleNode step="03" title="Prove" detail="Integrity evidence" active={evidence.length > 0} />
         </div>
-      </section>
+      </section>}
 
       <section className="metric-strip" aria-label="Key metrics">
         <Metric label="Active mandates" value={String(stats?.active_mandates ?? 0)} />
@@ -447,6 +474,205 @@ function Overview({
   );
 }
 
+function DemoProofConsole({
+  mandates,
+  evidence,
+  block,
+  onOpenEvidence,
+}: {
+  mandates: Mandate[];
+  evidence: Evidence[];
+  block?: PolicyEvent;
+  onOpenEvidence: (evidence: Evidence) => void;
+}) {
+  const [story, setStory] = useState<'blocked' | 'approved'>(block ? 'blocked' : 'approved');
+  const approvedEvidence =
+    evidence.find(
+      (item) =>
+        item.outcome === 'settled' &&
+        item.decision === 'matched' &&
+        item.merchant.toLowerCase().includes('staples'),
+    ) ??
+    evidence.find((item) => item.outcome === 'settled' && item.decision === 'matched');
+  const approvedMandate = approvedEvidence
+    ? mandates.find((mandate) => mandate.id === approvedEvidence.mandate_id)
+    : undefined;
+  const blockedMandate =
+    mandates.find((mandate) => mandate.task_id === block?.task_id) ??
+    mandates.find((mandate) => mandate.id === block?.details.mandate_id);
+  const blockedRequest = block?.details.request;
+  const blockedAmount = blockedRequest?.amount_cents ?? 0;
+  const blockedMerchant = blockedRequest?.merchant ?? 'Out-of-scope merchant';
+  const blockReason = block?.details.reasons?.[0]?.replaceAll('_', ' ') ?? 'outside approved authority';
+  const verifiedChecks =
+    approvedEvidence?.checks.filter((check) => check.result === 'pass').length ?? 0;
+
+  return (
+    <section className={`demo-proof-console story-${story}`} aria-label="Warden demo proof">
+      <div className="demo-proof-header">
+        <div>
+          <span className="demo-environment">
+            <span className="live-dot online" /> Deterministic test rail · real control loop
+          </span>
+          <h2>The credential that never existed is the product.</h2>
+          <p>
+            Warden turns a human decision into bounded agent execution—and proves what
+            happened after the rail responds.
+          </p>
+        </div>
+        <div className="demo-story-switch" aria-label="Choose demo moment">
+          {block && (
+            <button
+              type="button"
+              className={story === 'blocked' ? 'active blocked' : ''}
+              onClick={() => setStory('blocked')}
+              aria-pressed={story === 'blocked'}
+            >
+              Prevented attack
+            </button>
+          )}
+          {approvedEvidence && (
+            <button
+              type="button"
+              className={story === 'approved' ? 'active approved' : ''}
+              onClick={() => setStory('approved')}
+              aria-pressed={story === 'approved'}
+            >
+              Approved purchase
+            </button>
+          )}
+        </div>
+      </div>
+
+      {story === 'blocked' && block ? (
+        <>
+          <div className="proof-chain">
+            <ProofStage
+              step="01"
+              eyebrow="Human authority"
+              title={blockedMandate?.merchant ?? 'Approved payee'}
+              detail={blockedMandate?.purpose ?? 'Operator-approved purpose'}
+              meta={
+                blockedMandate
+                  ? `${dollars(blockedMandate.per_transaction_limit_cents)} per purchase`
+                  : 'Bounded mandate'
+              }
+            />
+            <ProofArrow />
+            <ProofStage
+              step="02"
+              eyebrow="Agent request"
+              title={blockedMerchant}
+              detail={`${dollars(blockedAmount)} requested after the payee changed`}
+              meta="Outside the mandate"
+              tone="danger"
+            />
+            <ProofArrow />
+            <ProofStage
+              step="03"
+              eyebrow="Warden decision"
+              title="Denied before credential"
+              detail={titleCase(blockReason)}
+              meta="$0 authority consumed"
+              tone="blocked"
+            />
+          </div>
+          <div className="proof-verdict blocked">
+            <Icon name="shield" />
+            <div>
+              <strong>No card existed to steal or misuse.</strong>
+              <span>
+                The request stopped at authorization, before the payment rail received a
+                credential.
+              </span>
+            </div>
+            <span className="verdict-badge">Credential prevented</span>
+          </div>
+        </>
+      ) : approvedEvidence ? (
+        <>
+          <div className="proof-chain">
+            <ProofStage
+              step="01"
+              eyebrow="Human authority"
+              title={approvedMandate?.merchant ?? approvedEvidence.merchant}
+              detail={approvedEvidence.purpose}
+              meta={
+                approvedMandate
+                  ? `${dollars(approvedMandate.amount_limit_cents)} total · ${dollars(approvedMandate.per_transaction_limit_cents)} per purchase`
+                  : 'Bounded mandate'
+              }
+            />
+            <ProofArrow />
+            <ProofStage
+              step="02"
+              eyebrow="Agent execution"
+              title={`${dollars(approvedEvidence.amount_cents)} at ${approvedEvidence.merchant}`}
+              detail={`Requested by ${approvedEvidence.agent}`}
+              meta="Atomically reserved"
+            />
+            <ProofArrow />
+            <ProofStage
+              step="03"
+              eyebrow="Rail outcome"
+              title="Settlement matched"
+              detail={`${verifiedChecks}/${approvedEvidence.checks.length} checks passed`}
+              meta={`Evidence #${approvedEvidence.integrity.sequence} · chain ${
+                approvedEvidence.integrity.verified ? 'verified' : 'verification failed'
+              }`}
+              tone={approvedEvidence.integrity.verified ? 'approved' : 'danger'}
+            />
+          </div>
+          <div className="proof-verdict approved">
+            <Icon name="check" />
+            <div>
+              <strong>Outcome linked to the exact authority that allowed it.</strong>
+              <span>Payee, amount, agent, purpose, and integrity checks remain inspectable.</span>
+            </div>
+            <button className="text-link" onClick={() => onOpenEvidence(approvedEvidence)}>
+              Inspect evidence <Icon name="arrow" />
+            </button>
+          </div>
+        </>
+      ) : null}
+    </section>
+  );
+}
+
+function ProofStage({
+  step,
+  eyebrow,
+  title,
+  detail,
+  meta,
+  tone = 'neutral',
+}: {
+  step: string;
+  eyebrow: string;
+  title: string;
+  detail: string;
+  meta: string;
+  tone?: 'neutral' | 'danger' | 'blocked' | 'approved';
+}) {
+  return (
+    <article className={`proof-stage tone-${tone}`}>
+      <span className="proof-stage-number">{step}</span>
+      <span className="eyebrow">{eyebrow}</span>
+      <h3>{title}</h3>
+      <p>{detail}</p>
+      <strong>{meta}</strong>
+    </article>
+  );
+}
+
+function ProofArrow() {
+  return (
+    <span className="proof-arrow" aria-hidden="true">
+      <Icon name="arrow" />
+    </span>
+  );
+}
+
 function MandatesView({
   token,
   mandates,
@@ -461,6 +687,21 @@ function MandatesView({
   const [busy, setBusy] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [revoking, setRevoking] = useState<Mandate | null>(null);
+  const [query, setQuery] = useState('');
+  const [statusFilter, setStatusFilter] = useState<Mandate['status'] | 'all'>('all');
+
+  const visibleMandates = useMemo(() => {
+    const normalizedQuery = query.trim().toLowerCase();
+    return mandates.filter((mandate) => {
+      const matchesStatus = statusFilter === 'all' || mandate.status === statusFilter;
+      const matchesQuery =
+        !normalizedQuery ||
+        [mandate.merchant, mandate.purpose, mandate.agent, mandate.task_id]
+          .filter(Boolean)
+          .some((value) => value!.toLowerCase().includes(normalizedQuery));
+      return matchesStatus && matchesQuery;
+    });
+  }, [mandates, query, statusFilter]);
 
   const activate = async (mandate: Mandate) => {
     setBusy(mandate.id);
@@ -495,14 +736,23 @@ function MandatesView({
       {actionError && <div className="inline-error">{actionError}</div>}
 
       {mandates.length ? (
-        <section className="mandate-registry">
+        <>
+          <RegistryControls
+            query={query}
+            onQueryChange={setQuery}
+            activeFilter={statusFilter}
+            filters={['all', 'active', 'draft', 'exhausted', 'revoked', 'expired']}
+            onFilterChange={(value) => setStatusFilter(value as Mandate['status'] | 'all')}
+            count={visibleMandates.length}
+            total={mandates.length}
+            label="mandates"
+          />
+          {visibleMandates.length ? (
+          <section className="mandate-registry">
           <div className="registry-head">
-            <span>Authority</span>
-            <span>Usage</span>
-            <span>State</span>
-            <span className="visually-hidden">Actions</span>
+            <span>Authority</span><span>Usage</span><span>State</span><span className="visually-hidden">Actions</span>
           </div>
-          {mandates.map((mandate) => {
+          {visibleMandates.map((mandate) => {
             const consumed = mandate.reserved_cents + mandate.settled_cents;
             const percent = Math.min(100, (consumed / mandate.amount_limit_cents) * 100);
             return (
@@ -558,7 +808,16 @@ function MandatesView({
               </article>
             );
           })}
-        </section>
+          </section>
+          ) : (
+            <FilteredEmptyState
+              icon="mandate"
+              title="No mandates match these filters"
+              body="Try a different status or clear your search to see the full authority registry."
+              onClear={() => { setQuery(''); setStatusFilter('all'); }}
+            />
+          )}
+        </>
       ) : (
         <section className="surface">
           <EmptyState
@@ -671,7 +930,18 @@ function EvidenceView({
   receipts: Receipt[];
   onSelect: (evidence: Evidence) => void;
 }) {
+  const [query, setQuery] = useState('');
+  const [outcomeFilter, setOutcomeFilter] = useState<Evidence['outcome'] | 'all'>('all');
   const unboundReceipts = receipts.filter((receipt) => !receipt.mandate_id);
+  const visibleEvidence = useMemo(() => {
+    const normalizedQuery = query.trim().toLowerCase();
+    return evidence.filter((item) => {
+      const matchesOutcome = outcomeFilter === 'all' || item.outcome === outcomeFilter;
+      const matchesQuery = !normalizedQuery || [item.merchant, item.purpose, item.agent, item.transaction_id]
+        .some((value) => value.toLowerCase().includes(normalizedQuery));
+      return matchesOutcome && matchesQuery;
+    });
+  }, [evidence, outcomeFilter, query]);
   return (
     <div className="view-stack enter">
       <section className="view-intro">
@@ -701,14 +971,26 @@ function EvidenceView({
       </section>
 
       {evidence.length ? (
-        <section className="evidence-table">
+        <>
+          <RegistryControls
+            query={query}
+            onQueryChange={setQuery}
+            activeFilter={outcomeFilter}
+            filters={['all', 'settled', 'pending', 'declined', 'reversed', 'refunded', 'violation']}
+            onFilterChange={(value) => setOutcomeFilter(value as Evidence['outcome'] | 'all')}
+            count={visibleEvidence.length}
+            total={evidence.length}
+            label="evidence"
+          />
+          {visibleEvidence.length ? (
+          <section className="evidence-table">
           <div className="evidence-table-head">
             <span>Outcome</span>
             <span>Authority</span>
             <span>Integrity</span>
             <span>Time</span>
           </div>
-          {evidence.map((item) => (
+          {visibleEvidence.map((item) => (
             <button
               className="evidence-row"
               key={item.id}
@@ -741,7 +1023,16 @@ function EvidenceView({
               </span>
             </button>
           ))}
-        </section>
+          </section>
+          ) : (
+            <FilteredEmptyState
+              icon="evidence"
+              title="No evidence matches these filters"
+              body="Change the outcome filter or clear your search to return to the full ledger."
+              onClear={() => { setQuery(''); setOutcomeFilter('all'); }}
+            />
+          )}
+        </>
       ) : (
         <section className="surface">
           <EmptyState
@@ -1117,14 +1408,27 @@ function PolicyEditor({
         setStatus('idle');
       } catch (error) {
         if (error instanceof UnauthorizedError) onUnauthorized();
+        else {
+          setStatus('error');
+          setMessage(error instanceof Error ? error.message : String(error));
+        }
       }
     },
     [token, onUnauthorized],
   );
 
   useEffect(() => {
-    void api.agents(token).then((response) => setAgents(response.agents)).catch(() => undefined);
-  }, [token]);
+    void api
+      .agents(token)
+      .then((response) => setAgents(response.agents))
+      .catch((error: unknown) => {
+        if (error instanceof UnauthorizedError) onUnauthorized();
+        else {
+          setStatus('error');
+          setMessage(error instanceof Error ? error.message : String(error));
+        }
+      });
+  }, [token, onUnauthorized]);
   useEffect(() => {
     setAgentDraft(agentName ?? '');
     void loadPolicy(agentName);
@@ -1416,6 +1720,73 @@ function EmptyState({
   );
 }
 
+function RegistryControls({
+  query,
+  onQueryChange,
+  activeFilter,
+  filters,
+  onFilterChange,
+  count,
+  total,
+  label,
+}: {
+  query: string;
+  onQueryChange: (value: string) => void;
+  activeFilter: string;
+  filters: readonly string[];
+  onFilterChange: (value: string) => void;
+  count: number;
+  total: number;
+  label: string;
+}) {
+  return (
+    <div className="registry-controls" aria-label={`Filter ${label}`}>
+      <label className="search-field">
+        <span className="visually-hidden">Search {label}</span>
+        <Icon name="search" />
+        <input
+          type="search"
+          value={query}
+          onChange={(event) => onQueryChange(event.target.value)}
+          placeholder="Search merchant, purpose, or agent"
+        />
+      </label>
+      <div className="filter-tabs" aria-label={`${label} status`}>
+        {filters.map((filter) => (
+          <button
+            key={filter}
+            type="button"
+            className={activeFilter === filter ? 'active' : ''}
+            aria-pressed={activeFilter === filter}
+            onClick={() => onFilterChange(filter)}
+          >
+            {filter === 'all' ? 'All' : titleCase(filter)}
+          </button>
+        ))}
+      </div>
+      <span className="filter-count" aria-live="polite">{count} of {total}</span>
+    </div>
+  );
+}
+
+function FilteredEmptyState({
+  icon,
+  title,
+  body,
+  onClear,
+}: {
+  icon: IconName;
+  title: string;
+  body: string;
+  onClear: () => void;
+}) {
+  return (
+    <section className="surface filter-empty-state">
+      <EmptyState icon={icon} title={title} body={body} action="Clear filters" onAction={onClear} />
+    </section>
+  );
+}
+
 function LoadingState() {
   return (
     <div className="loading-grid" aria-label="Loading">
@@ -1613,6 +1984,7 @@ function Icon({ name }: { name: IconName }) {
     clock: <><circle cx="12" cy="12" r="8.5" /><path d="M12 7v5l3 2" /></>,
     merchant: <><path d="M4 9h16l-2-5H6zM6 9v11h12V9M9 20v-6h6v6" /></>,
     agent: <><circle cx="12" cy="8" r="3.5" /><path d="M5 20c.7-4 3-6 7-6s6.3 2 7 6" /></>,
+    search: <><circle cx="10.5" cy="10.5" r="5.5" /><path d="m15 15 4 4" /></>,
   };
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">

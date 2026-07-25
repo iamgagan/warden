@@ -124,6 +124,58 @@ describe('mandates', () => {
     expect((await revokedResponse.json()).mandate.status).toBe('revoked');
   });
 
+  it('logs unexpected authority-write failures without exposing internals', async () => {
+    const agent = db.repo.getOrCreateAgent('procurement-agent');
+    const draft = db.repo.createMandate({
+      agentId: agent.id,
+      purpose: 'Buy paper',
+      merchant: 'Staples',
+      amountLimitCents: 1000,
+      perTransactionLimitCents: 1000,
+      maxTransactions: 1,
+      expiresAt: futureExpiry(),
+      rail: 'agentcard',
+      createdBy: 'operator',
+    });
+    const logs: string[] = [];
+    const brokenApp = createApiApp({
+      repo: {
+        ...db.repo,
+        activateMandate() {
+          throw new Error('disk path /secret/warden.db failed');
+        },
+        revokeMandate() {
+          throw new Error('database lock details');
+        },
+      } as typeof db.repo,
+      apiToken: TOKEN,
+      mode: 'test',
+      log: (line) => logs.push(line),
+    });
+
+    const activate = await brokenApp.request(`/api/v1/mandates/${draft.id}/activate`, {
+      ...auth,
+      method: 'POST',
+    });
+    expect(activate.status).toBe(500);
+    expect(await activate.json()).toEqual({
+      error: { code: 'INTERNAL_ERROR', message: 'could not activate mandate' },
+    });
+
+    const revoke = await brokenApp.request(`/api/v1/mandates/${draft.id}/revoke`, {
+      ...auth,
+      method: 'POST',
+      headers: { ...auth.headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ reason: 'cancelled' }),
+    });
+    expect(revoke.status).toBe(500);
+    expect(await revoke.json()).toEqual({
+      error: { code: 'INTERNAL_ERROR', message: 'could not revoke mandate' },
+    });
+    expect(logs.join('\n')).toContain('/secret/warden.db');
+    expect(logs.join('\n')).toContain('database lock details');
+  });
+
   it('rejects invalid or already-expired authority', async () => {
     const response = await app.request('/api/v1/mandates', {
       ...auth,
@@ -256,6 +308,9 @@ describe('receipts', () => {
       integrity: { verified: true },
     });
 
+    // Simulate a privileged/out-of-band attacker bypassing Warden's
+    // append-only trigger, then prove the hash verifier still fails closed.
+    db.sqlite.exec('DROP TRIGGER evidence_no_update');
     db.sqlite.prepare("UPDATE evidence SET payload_json = '{\"tampered\":true}'").run();
     const tampered = await (await app.request('/api/v1/evidence', auth)).json();
     expect(tampered.chain_verification).toMatchObject({

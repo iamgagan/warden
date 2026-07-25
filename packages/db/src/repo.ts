@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
-import { and, asc, desc, eq, isNull, lt, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull, lt, sql } from 'drizzle-orm';
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import { nanoid } from 'nanoid';
+import { normalizeMerchant } from '@warden/core';
 import {
   agents,
   approvals,
@@ -34,16 +35,11 @@ import {
 
 export type WardenDrizzle = BetterSQLite3Database;
 
+export class MandateNotFoundError extends Error {}
+export class MandateStateError extends Error {}
+
 const now = (): string => new Date().toISOString();
 const sha256 = (value: string): string => createHash('sha256').update(value).digest('hex');
-const normalizeMerchant = (value: string): string =>
-  value
-    .normalize('NFKC')
-    .trim()
-    .toLocaleLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, ' ')
-    .trim();
-
 export type AuthorizationReservationResult =
   | { kind: 'reserved' | 'existing'; authorization: AuthorizationRow }
   | {
@@ -184,6 +180,24 @@ export function createRepo(db: WardenDrizzle) {
       rail: 'auto' | 'agentcard' | 'stripe';
       createdBy: string;
     }): MandateRow {
+      if (!input.purpose.trim()) throw new Error('mandate purpose is required');
+      if (!input.merchant.trim()) throw new Error('mandate merchant is required');
+      if (!Number.isInteger(input.amountLimitCents) || input.amountLimitCents <= 0) {
+        throw new Error('mandate amount limit must be a positive integer');
+      }
+      if (
+        !Number.isInteger(input.perTransactionLimitCents) ||
+        input.perTransactionLimitCents <= 0 ||
+        input.perTransactionLimitCents > input.amountLimitCents
+      ) {
+        throw new Error('mandate per-transaction limit must be positive and within total authority');
+      }
+      if (!Number.isInteger(input.maxTransactions) || input.maxTransactions <= 0) {
+        throw new Error('mandate max transactions must be a positive integer');
+      }
+      if (!Number.isFinite(Date.parse(input.expiresAt)) || input.expiresAt <= now()) {
+        throw new Error('mandate expiry must be a future ISO timestamp');
+      }
       const row: MandateRow = {
         id: nanoid(),
         agentId: input.agentId,
@@ -217,10 +231,10 @@ export function createRepo(db: WardenDrizzle) {
     activateMandate(id: string, approvedBy: string): MandateRow {
       return db.transaction((tx) => {
         const mandate = tx.select().from(mandates).where(eq(mandates.id, id)).get();
-        if (!mandate) throw new Error(`unknown mandate ${id}`);
+        if (!mandate) throw new MandateNotFoundError(`unknown mandate ${id}`);
         if (mandate.status === 'active') return mandate;
         if (mandate.status !== 'draft') {
-          throw new Error(`mandate ${id} is ${mandate.status}`);
+          throw new MandateStateError(`mandate ${id} is ${mandate.status}`);
         }
         const activatedAt = now();
         if (mandate.expiresAt <= activatedAt) {
@@ -229,7 +243,7 @@ export function createRepo(db: WardenDrizzle) {
             .set({ status: 'expired', closedAt: activatedAt, closeReason: 'expired before activation' })
             .where(eq(mandates.id, id))
             .run();
-          throw new Error(`mandate ${id} is expired`);
+          throw new MandateStateError(`mandate ${id} is expired`);
         }
         const policy = tx
           .select()
@@ -290,17 +304,26 @@ export function createRepo(db: WardenDrizzle) {
     },
 
     getMandate(id: string): MandateRow | undefined {
-      const row = db.select().from(mandates).where(eq(mandates.id, id)).get();
-      if (row?.status === 'active' && row.expiresAt <= now()) {
-        db
-          .update(mandates)
-          .set({ status: 'expired', closedAt: now(), closeReason: 'expiry reached' })
-          .where(and(eq(mandates.id, id), eq(mandates.status, 'active')))
-          .run();
-        if (row.taskId) this.setTaskStatus(row.taskId, 'expired');
-        return db.select().from(mandates).where(eq(mandates.id, id)).get();
-      }
-      return row;
+      return db.transaction((tx) => {
+        const row = tx.select().from(mandates).where(eq(mandates.id, id)).get();
+        const expiredAt = now();
+        if (row?.status === 'active' && row.expiresAt <= expiredAt) {
+          tx
+            .update(mandates)
+            .set({ status: 'expired', closedAt: expiredAt, closeReason: 'expiry reached' })
+            .where(and(eq(mandates.id, id), eq(mandates.status, 'active')))
+            .run();
+          if (row.taskId) {
+            tx
+              .update(tasks)
+              .set({ status: 'expired', closedAt: expiredAt })
+              .where(eq(tasks.id, row.taskId))
+              .run();
+          }
+          return tx.select().from(mandates).where(eq(mandates.id, id)).get();
+        }
+        return row;
+      });
     },
 
     listMandates(status?: MandateStatus): MandateRow[] {
@@ -337,9 +360,9 @@ export function createRepo(db: WardenDrizzle) {
     revokeMandate(id: string, reason: string, revokedBy: string): MandateRow {
       return db.transaction((tx) => {
         const mandate = tx.select().from(mandates).where(eq(mandates.id, id)).get();
-        if (!mandate) throw new Error(`unknown mandate ${id}`);
+        if (!mandate) throw new MandateNotFoundError(`unknown mandate ${id}`);
         if (!['draft', 'active'].includes(mandate.status)) {
-          throw new Error(`mandate ${id} is ${mandate.status}`);
+          throw new MandateStateError(`mandate ${id} is ${mandate.status}`);
         }
         const closedAt = now();
         tx
@@ -427,7 +450,18 @@ export function createRepo(db: WardenDrizzle) {
         if (input.amountCents > mandate.perTransactionLimitCents) {
           return { kind: 'denied', reason: 'amount_exceeds_limit' };
         }
-        if (mandate.transactionCount >= mandate.maxTransactions) {
+        const openReservations =
+          tx
+            .select({ count: sql<number>`count(*)` })
+            .from(authorizations)
+            .where(
+              and(
+                eq(authorizations.mandateId, mandate.id),
+                inArray(authorizations.status, ['reserved', 'card_issued']),
+              ),
+            )
+            .get()?.count ?? 0;
+        if (mandate.transactionCount + openReservations >= mandate.maxTransactions) {
           return { kind: 'denied', reason: 'transaction_limit_reached' };
         }
 
@@ -450,14 +484,12 @@ export function createRepo(db: WardenDrizzle) {
           .update(mandates)
           .set({
             reservedCents: sql`${mandates.reservedCents} + ${input.amountCents}`,
-            transactionCount: sql`${mandates.transactionCount} + 1`,
           })
           .where(
             and(
               eq(mandates.id, input.mandateId),
               eq(mandates.status, 'active'),
               sql`${mandates.reservedCents} + ${mandates.settledCents} + ${input.amountCents} <= ${mandates.amountLimitCents}`,
-              sql`${mandates.transactionCount} < ${mandates.maxTransactions}`,
             ),
           )
           .run();
@@ -486,12 +518,13 @@ export function createRepo(db: WardenDrizzle) {
       });
     },
 
-    bindAuthorizationCard(id: string, cardId: string): void {
-      db
+    bindAuthorizationCard(id: string, cardId: string): boolean {
+      const result = db
         .update(authorizations)
         .set({ cardId, status: 'card_issued', updatedAt: now() })
         .where(and(eq(authorizations.id, id), eq(authorizations.status, 'reserved')))
         .run();
+      return result.changes > 0;
     },
 
     getAuthorizationByCard(cardId: string): AuthorizationRow | undefined {
@@ -514,6 +547,21 @@ export function createRepo(db: WardenDrizzle) {
         .get();
     },
 
+    countOpenAuthorizations(mandateId: string): number {
+      return (
+        db
+          .select({ count: sql<number>`count(*)` })
+          .from(authorizations)
+          .where(
+            and(
+              eq(authorizations.mandateId, mandateId),
+              inArray(authorizations.status, ['reserved', 'card_issued']),
+            ),
+          )
+          .get()?.count ?? 0
+      );
+    },
+
     releaseAuthorization(id: string): boolean {
       return db.transaction((tx) => {
         const authorization = tx.select().from(authorizations).where(eq(authorizations.id, id)).get();
@@ -527,7 +575,6 @@ export function createRepo(db: WardenDrizzle) {
           .update(mandates)
           .set({
             reservedCents: sql`max(0, ${mandates.reservedCents} - ${authorization.amountCents})`,
-            transactionCount: sql`max(0, ${mandates.transactionCount} - 1)`,
           })
           .where(eq(mandates.id, authorization.mandateId))
           .run();
@@ -555,6 +602,7 @@ export function createRepo(db: WardenDrizzle) {
         ) {
           return false;
         }
+        if (settledCents > authorization.amountCents) return false;
         const firstSettlement = authorization.status !== 'settled';
         const delta = settledCents - authorization.settledCents;
         tx
@@ -578,6 +626,9 @@ export function createRepo(db: WardenDrizzle) {
               ? sql`max(0, ${mandates.reservedCents} - ${authorization.amountCents})`
               : mandates.reservedCents,
             settledCents: sql`${mandates.settledCents} + ${delta}`,
+            transactionCount: firstSettlement
+              ? sql`${mandates.transactionCount} + 1`
+              : mandates.transactionCount,
           })
           .where(eq(mandates.id, authorization.mandateId))
           .run();
@@ -587,8 +638,9 @@ export function createRepo(db: WardenDrizzle) {
           .where(eq(mandates.id, authorization.mandateId))
           .get()!;
         if (
-          mandate.settledCents + mandate.reservedCents >= mandate.amountLimitCents ||
-          mandate.transactionCount >= mandate.maxTransactions
+          mandate.reservedCents === 0 &&
+          (mandate.settledCents >= mandate.amountLimitCents ||
+            mandate.transactionCount >= mandate.maxTransactions)
         ) {
           tx
             .update(mandates)
@@ -830,7 +882,7 @@ export function createRepo(db: WardenDrizzle) {
         .orderBy(desc(receipts.createdAt), desc(receipts.id))
         .limit(filter.limit)
         .all();
-      return rows.map((r) => ({ ...r.receipt, ...r, receipt: undefined }) as unknown as ReceiptListItem);
+      return rows.map(({ receipt, ...details }) => ({ ...receipt, ...details }));
     },
 
     countReceipts(): number {
@@ -850,7 +902,19 @@ export function createRepo(db: WardenDrizzle) {
     }): EvidenceRow {
       return db.transaction((tx) => {
         const existing = tx.select().from(evidence).where(eq(evidence.eventKey, input.eventKey)).get();
-        if (existing) return existing;
+        if (existing) {
+          const sameRecord =
+            existing.receiptId === input.receiptId &&
+            existing.mandateId === input.mandateId &&
+            existing.authorizationId === input.authorizationId &&
+            existing.transactionId === input.transactionId &&
+            existing.outcome === input.outcome &&
+            existing.payloadJson === JSON.stringify(input.payload);
+          if (!sameRecord) {
+            throw new Error(`evidence event key ${input.eventKey} was reused with different data`);
+          }
+          return existing;
+        }
         const latest = tx.select().from(evidence).orderBy(desc(evidence.sequence)).limit(1).get();
         const sequence = (latest?.sequence ?? 0) + 1;
         const previousHash = latest?.evidenceHash ?? null;
@@ -942,7 +1006,10 @@ export function createRepo(db: WardenDrizzle) {
               firstInvalidSequence: row.sequence,
             };
           }
-        } catch {
+        } catch (error) {
+          console.error(
+            `[warden-db] evidence chain verification failed at sequence ${row.sequence}: ${String(error)}`,
+          );
           return {
             valid: false,
             checkedRecords: expectedSequence - 1,
@@ -974,7 +1041,7 @@ export function createRepo(db: WardenDrizzle) {
         .orderBy(desc(evidence.sequence))
         .limit(filter.limit)
         .all()
-        .map((row) => ({ ...row.evidence, ...row, evidence: undefined }) as unknown as EvidenceListItem);
+        .map(({ evidence: evidenceRow, ...details }) => ({ ...evidenceRow, ...details }));
     },
 
     // ── policy events (APPEND-ONLY) ───────────────────────────────────────

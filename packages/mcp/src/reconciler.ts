@@ -1,4 +1,5 @@
 import type { CardRow, ReceiptRow, Repo, TaskRow } from '@warden/db';
+import { DEFAULT_POLICY, normalizeMerchant, parsePolicyRules } from '@warden/core';
 import { UpstreamError, type Rail, type UpstreamClient, type UpstreamTxn } from '@warden/upstream';
 
 export interface ReconcilerStatus {
@@ -61,6 +62,7 @@ export class Reconciler {
     this.running = true;
     try {
       let passError: string | null = null;
+      await this.expireStaleCards();
       const cards = [...this.repo.listCardsByState('open'), ...this.repo.listCardsByState('used')];
       for (const card of cards) {
         try {
@@ -84,6 +86,39 @@ export class Reconciler {
     }
   }
 
+  private async expireStaleCards(): Promise<void> {
+    const currentTime = Date.now();
+    for (const card of this.repo.listCardsByState('open')) {
+      const task = this.repo.getTask(card.taskId);
+      if (!task) continue;
+      const policy = task.policyId ? this.repo.getPolicy(task.policyId) : undefined;
+      const rules = policy ? parsePolicyRules(policy.rulesJson) : DEFAULT_POLICY;
+      const expiresAt = Date.parse(card.createdAt) + rules.card_ttl_minutes * 60_000;
+      if (!Number.isFinite(expiresAt) || expiresAt > currentTime) continue;
+      const upstream = this.upstreams[card.rail];
+      if (!upstream) continue;
+      try {
+        await upstream.closeCard(card.id);
+        const authorization = this.repo.getAuthorizationByCard(card.id);
+        if (authorization) this.repo.releaseAuthorization(authorization.id);
+        else this.repo.addTaskSpent(task.id, -card.amountCents);
+        this.repo.setCardState(card.id, 'expired');
+        this.repo.insertPolicyEvent({
+          type: 'card_closed',
+          taskId: task.id,
+          agentId: task.agentId,
+          detailsJson: JSON.stringify({
+            card_id: card.id,
+            reason: 'credential_ttl_expired',
+            ttl_minutes: rules.card_ttl_minutes,
+          }),
+        });
+      } catch (error) {
+        this.log(`[reconciler] card ${card.id}: TTL close failed: ${String(error)}`);
+      }
+    }
+  }
+
   private async reconcileCard(card: CardRow): Promise<void> {
     const upstream = this.upstreams[card.rail];
     if (!upstream) {
@@ -94,7 +129,11 @@ export class Reconciler {
     let inactiveMandateReason: string | null = null;
     if (task?.mandateId) {
       const mandate = this.repo.getMandate(task.mandateId);
-      if (!mandate || mandate.status !== 'active') {
+      if (
+        !mandate ||
+        mandate.status === 'revoked' ||
+        mandate.status === 'expired'
+      ) {
         inactiveMandateReason = `mandate_${mandate?.status ?? 'missing'}`;
         // Stop new authorizations first, then make one final rail read. A
         // settlement may have landed immediately before revocation/expiry and
@@ -344,15 +383,6 @@ export class Reconciler {
       });
     }
   }
-}
-
-function normalizeMerchant(value: string): string {
-  return value
-    .normalize('NFKC')
-    .trim()
-    .toLocaleLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, ' ')
-    .trim();
 }
 
 function transactionOutcome(

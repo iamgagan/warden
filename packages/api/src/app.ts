@@ -1,7 +1,15 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { PolicyRulesSchema } from '@warden/core';
-import type { EvidenceListItem, EvidenceRow, MandateRow, PolicyRow, Repo } from '@warden/db';
+import {
+  MandateNotFoundError,
+  MandateStateError,
+  type EvidenceListItem,
+  type EvidenceRow,
+  type MandateRow,
+  type PolicyRow,
+  type Repo,
+} from '@warden/db';
 
 export interface UpstreamAuthStatus {
   upstream_auth: 'ok' | 'needs_login';
@@ -15,6 +23,7 @@ export interface ApiOptions {
   reconcilerStatus?: UpstreamAuthStatus;
   /** Display attribution for approvals made through this local operator API. */
   operatorName?: string;
+  log?: (line: string) => void;
 }
 
 const apiError = (code: string, message: string) => ({ error: { code, message } });
@@ -81,6 +90,7 @@ const evidenceQuery = z.object({
 /** SPEC §3.3 — read paths (T9). Bearer auth on everything except /healthz. */
 export function createApiApp(opts: ApiOptions): Hono {
   const { repo } = opts;
+  const log = opts.log ?? ((line: string) => console.error(line));
   const app = new Hono();
 
   app.get('/healthz', (c) =>
@@ -154,8 +164,14 @@ export function createApiApp(opts: ApiOptions): Hono {
       return c.json({ mandate: mandateJson(mandate, agent?.name ?? 'Unknown') });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const status = message.startsWith('unknown mandate') ? 404 : 409;
-      return c.json(apiError(status === 404 ? 'NOT_FOUND' : 'INVALID_STATE', message), status);
+      if (error instanceof MandateNotFoundError) {
+        return c.json(apiError('NOT_FOUND', message), 404);
+      }
+      if (error instanceof MandateStateError) {
+        return c.json(apiError('INVALID_STATE', message), 409);
+      }
+      log(`[warden-api] activate mandate ${c.req.param('id')} failed: ${message}`);
+      return c.json(apiError('INTERNAL_ERROR', 'could not activate mandate'), 500);
     }
   });
 
@@ -173,8 +189,14 @@ export function createApiApp(opts: ApiOptions): Hono {
       return c.json({ mandate: mandateJson(mandate, agent?.name ?? 'Unknown') });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const status = message.startsWith('unknown mandate') ? 404 : 409;
-      return c.json(apiError(status === 404 ? 'NOT_FOUND' : 'INVALID_STATE', message), status);
+      if (error instanceof MandateNotFoundError) {
+        return c.json(apiError('NOT_FOUND', message), 404);
+      }
+      if (error instanceof MandateStateError) {
+        return c.json(apiError('INVALID_STATE', message), 409);
+      }
+      log(`[warden-api] revoke mandate ${c.req.param('id')} failed: ${message}`);
+      return c.json(apiError('INTERNAL_ERROR', 'could not revoke mandate'), 500);
     }
   });
 

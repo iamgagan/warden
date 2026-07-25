@@ -220,7 +220,7 @@ describe('mandates and atomic authorizations', () => {
     expect(overspend).toMatchObject({ kind: 'denied', reason: 'budget_unavailable' });
     expect(db.repo.getMandate(mandate.id)).toMatchObject({
       reservedCents: 800,
-      transactionCount: 1,
+      transactionCount: 0,
     });
     expect(db.repo.getTask(mandate.taskId!)?.spentCents).toBe(800);
   });
@@ -276,6 +276,186 @@ describe('mandates and atomic authorizations', () => {
 
     expect(db.repo.listMandates().find((row) => row.id === mandate.id)?.status).toBe('expired');
     expect(db.repo.getTask(mandate.taskId!)?.status).toBe('expired');
+  });
+
+  it('rejects invalid mandates at the repository boundary', () => {
+    const agent = db.repo.getOrCreateAgent('validation-agent');
+    const valid = {
+      agentId: agent.id,
+      purpose: 'Buy supplies',
+      merchant: 'Staples',
+      amountLimitCents: 1000,
+      perTransactionLimitCents: 500,
+      maxTransactions: 1,
+      expiresAt: futureExpiry(),
+      rail: 'agentcard' as const,
+      createdBy: 'operator',
+    };
+    expect(() => db.repo.createMandate({ ...valid, amountLimitCents: -1 })).toThrow(
+      /amount limit/,
+    );
+    expect(() =>
+      db.repo.createMandate({ ...valid, perTransactionLimitCents: 1500 }),
+    ).toThrow(/per-transaction/);
+    expect(() =>
+      db.repo.createMandate({ ...valid, expiresAt: '2000-01-01T00:00:00.000Z' }),
+    ).toThrow(/expiry/);
+  });
+
+  it('handles activation, revocation, and status-filter edge cases explicitly', () => {
+    const agent = db.repo.getOrCreateAgent('state-agent');
+    const create = () =>
+      db.repo.createMandate({
+        agentId: agent.id,
+        purpose: 'Buy supplies',
+        merchant: 'Staples',
+        amountLimitCents: 1000,
+        perTransactionLimitCents: 1000,
+        maxTransactions: 1,
+        expiresAt: futureExpiry(),
+        rail: 'agentcard',
+        createdBy: 'operator',
+      });
+    const active = db.repo.activateMandate(create().id, 'operator');
+    const draft = create();
+
+    expect(db.repo.activateMandate(active.id, 'operator').id).toBe(active.id);
+    expect(db.repo.listMandates('active').map((row) => row.id)).toEqual([active.id]);
+    expect(db.repo.listMandates('draft').map((row) => row.id)).toEqual([draft.id]);
+    expect(() => db.repo.activateMandate('missing', 'operator')).toThrow(/unknown mandate/);
+    db.repo.revokeMandate(active.id, 'cancelled', 'operator');
+    expect(() => db.repo.activateMandate(active.id, 'operator')).toThrow(/revoked/);
+    expect(() => db.repo.revokeMandate(active.id, 'again', 'operator')).toThrow(/revoked/);
+    expect(() => db.repo.revokeMandate('missing', 'cancelled', 'operator')).toThrow(
+      /unknown mandate/,
+    );
+  });
+
+  it('enforces rail, amount, transaction-slot, and idempotency conflicts in the atomic gate', () => {
+    const agent = db.repo.getOrCreateAgent('enforcement-agent');
+    const mandate = db.repo.activateMandate(
+      db.repo.createMandate({
+        agentId: agent.id,
+        purpose: 'Buy supplies',
+        merchant: 'Staples Inc.',
+        amountLimitCents: 3000,
+        perTransactionLimitCents: 1500,
+        maxTransactions: 1,
+        expiresAt: futureExpiry(),
+        rail: 'agentcard',
+        createdBy: 'operator',
+      }).id,
+      'operator',
+    );
+    const request = {
+      mandateId: mandate.id,
+      taskId: mandate.taskId!,
+      idempotencyKey: 'one',
+      requestHash: 'hash-one',
+      amountCents: 1000,
+      merchant: 'Staples—Inc',
+      category: null,
+      rail: 'agentcard' as const,
+    };
+
+    expect(
+      db.repo.reserveAuthorization({ ...request, idempotencyKey: 'rail', rail: 'stripe' }),
+    ).toMatchObject({ kind: 'denied', reason: 'rail_not_allowed' });
+    expect(
+      db.repo.reserveAuthorization({
+        ...request,
+        idempotencyKey: 'amount',
+        amountCents: 1600,
+      }),
+    ).toMatchObject({ kind: 'denied', reason: 'amount_exceeds_limit' });
+    expect(db.repo.reserveAuthorization(request)).toMatchObject({ kind: 'reserved' });
+    expect(
+      db.repo.reserveAuthorization({ ...request, requestHash: 'different' }),
+    ).toMatchObject({ kind: 'denied', reason: 'idempotency_conflict' });
+    expect(
+      db.repo.reserveAuthorization({
+        ...request,
+        idempotencyKey: 'two',
+        requestHash: 'hash-two',
+      }),
+    ).toMatchObject({ kind: 'denied', reason: 'transaction_limit_reached' });
+  });
+
+  it('counts transaction use at settlement without closing other valid reservations', () => {
+    const agent = db.repo.getOrCreateAgent('multi-use-agent');
+    const mandate = db.repo.activateMandate(
+      db.repo.createMandate({
+        agentId: agent.id,
+        purpose: 'Buy supplies',
+        merchant: 'Staples',
+        amountLimitCents: 3000,
+        perTransactionLimitCents: 1000,
+        maxTransactions: 3,
+        expiresAt: futureExpiry(),
+        rail: 'agentcard',
+        createdBy: 'operator',
+      }).id,
+      'operator',
+    );
+    const reservations = ['one', 'two', 'three'].map((key) =>
+      db.repo.reserveAuthorization({
+        mandateId: mandate.id,
+        taskId: mandate.taskId!,
+        idempotencyKey: key,
+        requestHash: key,
+        amountCents: 1000,
+        merchant: 'Staples',
+        category: null,
+        rail: 'agentcard',
+      }),
+    );
+    expect(reservations.every((result) => result.kind === 'reserved')).toBe(true);
+    const first = reservations[0]!;
+    if (first.kind === 'denied') throw new Error('reservation unexpectedly denied');
+
+    expect(db.repo.settleAuthorization(first.authorization.id, 1000)).toBe(true);
+    expect(db.repo.getMandate(mandate.id)).toMatchObject({
+      status: 'active',
+      reservedCents: 2000,
+      settledCents: 1000,
+      transactionCount: 1,
+    });
+  });
+
+  it('refuses cumulative settlement above the reserved ceiling', () => {
+    const agent = db.repo.getOrCreateAgent('capture-agent');
+    const mandate = db.repo.activateMandate(
+      db.repo.createMandate({
+        agentId: agent.id,
+        purpose: 'Buy supplies',
+        merchant: 'Staples',
+        amountLimitCents: 2000,
+        perTransactionLimitCents: 1000,
+        maxTransactions: 2,
+        expiresAt: futureExpiry(),
+        rail: 'agentcard',
+        createdBy: 'operator',
+      }).id,
+      'operator',
+    );
+    const reserved = db.repo.reserveAuthorization({
+      mandateId: mandate.id,
+      taskId: mandate.taskId!,
+      idempotencyKey: 'capture',
+      requestHash: 'capture',
+      amountCents: 1000,
+      merchant: 'Staples',
+      category: null,
+      rail: 'agentcard',
+    });
+    if (reserved.kind === 'denied') throw new Error('reservation unexpectedly denied');
+
+    expect(db.repo.settleAuthorization(reserved.authorization.id, 1001)).toBe(false);
+    expect(db.repo.getMandate(mandate.id)).toMatchObject({
+      reservedCents: 1000,
+      settledCents: 0,
+      transactionCount: 0,
+    });
   });
 });
 
@@ -366,6 +546,94 @@ describe('receipts', () => {
     expect(page3).toHaveLength(1);
     const allIds = [...page1, ...page2, ...page3].map((r) => r.id);
     expect(new Set(allIds).size).toBe(5);
+  });
+});
+
+describe('evidence integrity', () => {
+  function seedEvidence() {
+    const agent = db.repo.getOrCreateAgent('evidence-agent');
+    const mandate = db.repo.activateMandate(
+      db.repo.createMandate({
+        agentId: agent.id,
+        purpose: 'Buy supplies',
+        merchant: 'Staples',
+        amountLimitCents: 1000,
+        perTransactionLimitCents: 1000,
+        maxTransactions: 1,
+        expiresAt: futureExpiry(),
+        rail: 'agentcard',
+        createdBy: 'operator',
+      }).id,
+      'operator',
+    );
+    const authorization = db.repo.reserveAuthorization({
+      mandateId: mandate.id,
+      taskId: mandate.taskId!,
+      idempotencyKey: 'evidence',
+      requestHash: 'evidence',
+      amountCents: 500,
+      merchant: 'Staples',
+      category: null,
+      rail: 'agentcard',
+    });
+    if (authorization.kind === 'denied') throw new Error('reservation unexpectedly denied');
+    const card = db.repo.insertCard({
+      id: 'evidence-card',
+      taskId: mandate.taskId!,
+      amountCents: 500,
+      merchantHint: 'Staples',
+      sandbox: true,
+      rail: 'agentcard',
+    });
+    expect(db.repo.bindAuthorizationCard(authorization.authorization.id, card.id)).toBe(true);
+    db.repo.insertTransactionIfNew(txnRow('evidence-txn', card.id, { amountCents: 450 }));
+    const receipt = db.repo.insertReceipt({
+      transactionId: 'evidence-txn',
+      taskId: mandate.taskId!,
+      intent: mandate.purpose,
+      policyId: mandate.policyId,
+      decisionJson: '{}',
+    });
+    const input = {
+      receiptId: receipt.id,
+      mandateId: mandate.id,
+      authorizationId: authorization.authorization.id,
+      transactionId: 'evidence-txn',
+      eventKey: 'evidence-txn:SETTLED',
+      outcome: 'settled' as const,
+      payload: { decision: 'matched' },
+    };
+    return { row: db.repo.insertEvidence(input), input };
+  }
+
+  it('enforces append-only evidence at the database boundary', () => {
+    const { row } = seedEvidence();
+    expect(() =>
+      db.sqlite.prepare("UPDATE evidence SET payload_json = '{}' WHERE id = ?").run(row.id),
+    ).toThrow(/append-only/);
+    expect(() => db.sqlite.prepare('DELETE FROM evidence WHERE id = ?').run(row.id)).toThrow(
+      /append-only/,
+    );
+  });
+
+  it('rejects an idempotency key reused with different evidence data', () => {
+    const { row, input } = seedEvidence();
+    expect(db.repo.insertEvidence(input).id).toBe(row.id);
+    expect(() =>
+      db.repo.insertEvidence({ ...input, payload: { decision: 'mismatch' } }),
+    ).toThrow(/reused with different data/);
+  });
+
+  it('detects a privileged hash-link break as well as payload tampering', () => {
+    const { row } = seedEvidence();
+    db.sqlite.exec('DROP TRIGGER evidence_no_update');
+    db.sqlite
+      .prepare("UPDATE evidence SET previous_hash = 'broken-link' WHERE id = ?")
+      .run(row.id);
+    expect(db.repo.verifyEvidenceChain()).toMatchObject({
+      valid: false,
+      firstInvalidSequence: 1,
+    });
   });
 });
 

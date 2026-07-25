@@ -110,6 +110,35 @@ export interface Stats {
   evidence_total: number;
 }
 
+export interface PolicyEvent {
+  id: string;
+  type:
+    | 'block'
+    | 'circuit_break'
+    | 'approval_required'
+    | 'approved'
+    | 'denied'
+    | 'card_issued'
+    | 'card_closed';
+  task_id: string | null;
+  agent_id: string | null;
+  details: {
+    reasons?: string[];
+    request?: {
+      amount_cents?: number;
+      merchant?: string;
+      category?: string;
+      idempotency_key?: string;
+    };
+    mandate_id?: string;
+    enforced_at?: string;
+    amount_cents?: number;
+    merchant?: string | null;
+    [key: string]: unknown;
+  };
+  created_at: string;
+}
+
 export interface Health {
   ok: boolean;
   mode: 'test' | 'live';
@@ -153,6 +182,8 @@ export interface PolicyResponse {
   versions: PolicyVersion[];
 }
 
+export type PutPolicyResponse = Omit<PolicyResponse, 'versions'>;
+
 export class UnauthorizedError extends Error {}
 
 async function request<T>(path: string, token: string, init?: RequestInit): Promise<T> {
@@ -176,6 +207,7 @@ async function request<T>(path: string, token: string, init?: RequestInit): Prom
         : undefined;
     throw new Error(message || `Request failed (${res.status})`);
   }
+  if (body === null) throw new Error(`Request returned an invalid response (${res.status})`);
   return body as T;
 }
 
@@ -211,6 +243,8 @@ export const api = {
   stats: (token: string): Promise<Stats> => request('/api/v1/stats', token),
   agents: (token: string): Promise<{ agents: AgentSummary[] }> =>
     request('/api/v1/agents', token),
+  events: (token: string, limit = 100): Promise<{ events: PolicyEvent[] }> =>
+    request(`/api/v1/events?limit=${limit}`, token),
   policies: (token: string, agentName?: string | null): Promise<PolicyResponse> =>
     request(
       `/api/v1/policies${agentName ? `?agent=${encodeURIComponent(agentName)}` : ''}`,
@@ -220,7 +254,7 @@ export const api = {
     token: string,
     agentName: string | null,
     rules: PolicyRules,
-  ): Promise<PolicyResponse> =>
+  ): Promise<PutPolicyResponse> =>
     request('/api/v1/policies', token, {
       method: 'PUT',
       body: JSON.stringify({ agent_name: agentName, rules }),

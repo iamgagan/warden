@@ -511,7 +511,7 @@ describe('mandate authority', () => {
     expect(await upstream.listCards()).toHaveLength(1);
     expect(db.repo.getMandate(active.id)).toMatchObject({
       reservedCents: 1500,
-      transactionCount: 1,
+      transactionCount: 0,
     });
   });
 
@@ -551,7 +551,7 @@ describe('mandate authority', () => {
     expect(await upstream.listCards()).toHaveLength(1);
     expect(db.repo.getMandate(active.id)).toMatchObject({
       reservedCents: 1000,
-      transactionCount: 1,
+      transactionCount: 0,
     });
   });
 
@@ -608,8 +608,66 @@ describe('mandate authority', () => {
     expect(card.card_id).toBe('mock_card_1');
     expect(db.repo.getMandate(active.id)).toMatchObject({
       reservedCents: 1000,
-      transactionCount: 1,
+      transactionCount: 0,
     });
+  });
+
+  it('keeps authority reserved and raises an operational alarm when persistence and close both fail', async () => {
+    const agent = db.repo.getOrCreateAgent('procurement-agent');
+    const active = db.repo.activateMandate(
+      db.repo.createMandate({
+        agentId: agent.id,
+        purpose: 'Buy paper',
+        merchant: 'Staples',
+        amountLimitCents: 2000,
+        perTransactionLimitCents: 2000,
+        maxTransactions: 1,
+        expiresAt: futureExpiry(),
+        rail: 'agentcard',
+        createdBy: 'operator',
+      }).id,
+      'operator',
+    );
+    const brokenRepo = {
+      ...db.repo,
+      insertCard() {
+        throw new Error('disk write failed');
+      },
+    } as typeof db.repo;
+    const brokenRail: UpstreamClient = {
+      createCard: (request) => upstream.createCard(request),
+      async closeCard() {
+        throw new UpstreamError('rail close failed');
+      },
+      getCardDetails: (id) => upstream.getCardDetails(id),
+      listTransactions: (id, options) => upstream.listTransactions(id, options),
+      listCards: () => upstream.listCards(),
+      checkBalance: (id) => upstream.checkBalance(id),
+    };
+    const logs: string[] = [];
+    const failClosedService = new WardenService({
+      repo: brokenRepo,
+      upstreams: { agentcard: brokenRail },
+      mode: 'test',
+      actorAgentName: 'procurement-agent',
+      log: (line) => logs.push(line),
+    });
+
+    await expect(
+      failClosedService.issueCard({
+        task_id: active.taskId!,
+        amount_cents: 1000,
+        merchant: 'Staples',
+        idempotency_key: 'orphan-risk',
+      }),
+    ).rejects.toThrow(/disk write failed/);
+    expect(db.repo.getMandate(active.id)).toMatchObject({
+      reservedCents: 1000,
+      transactionCount: 0,
+    });
+    expect(db.repo.countPolicyEvents('circuit_break')).toBe(1);
+    expect(logs.join('\n')).toMatch(/CRITICAL orphan-risk/);
+    expect(await upstream.listCards()).toHaveLength(1);
   });
 });
 
@@ -649,6 +707,39 @@ describe('warden_precheck_purchase', () => {
       service.precheckPurchase({ task_id: 'nope', merchant: 'staples', amount_cents: 100 }),
     ).toThrow();
   });
+
+  it('reports no remaining use and blocks precheck while the only slot is reserved', async () => {
+    const agent = db.repo.getOrCreateAgent('procurement-agent');
+    const active = db.repo.activateMandate(
+      db.repo.createMandate({
+        agentId: agent.id,
+        purpose: 'Buy paper',
+        merchant: 'Staples',
+        amountLimitCents: 2000,
+        perTransactionLimitCents: 1000,
+        maxTransactions: 1,
+        expiresAt: futureExpiry(),
+        rail: 'agentcard',
+        createdBy: 'operator',
+      }).id,
+      'operator',
+    );
+    await service.issueCard({
+      task_id: active.taskId!,
+      amount_cents: 1000,
+      merchant: 'Staples',
+      idempotency_key: 'slot-one',
+    });
+
+    expect(service.listMyMandates().mandates[0]?.transactions_remaining).toBe(0);
+    expect(
+      service.precheckPurchase({
+        task_id: active.taskId!,
+        merchant: 'Staples',
+        amount_cents: 500,
+      }),
+    ).toMatchObject({ decision: 'block' });
+  });
 });
 
 describe('warden_get_card_details', () => {
@@ -671,6 +762,20 @@ describe('warden_get_card_details', () => {
     db.repo.setCardState(card_id, 'closed');
     await expect(service.getCardDetails({ card_id })).rejects.toMatchObject({
       code: 'POLICY_BLOCKED',
+    });
+  });
+});
+
+describe('read-only card pass-throughs', () => {
+  it('lists configured-rail cards and reads balance from the card rail', async () => {
+    const { task_id } = service.startTask({ agent_name: 'shopper', intent: 'x' });
+    const card = await service.issueCard({ task_id, amount_cents: 1000 });
+
+    expect(await service.listCards()).toEqual([
+      expect.objectContaining({ card_id: card.card_id, rail: 'agentcard' }),
+    ]);
+    expect(await service.checkBalance({ card_id: card.card_id })).toEqual({
+      balance_cents: 1000,
     });
   });
 });

@@ -198,13 +198,15 @@ tbody tr:hover { background: #fafaf9; }
 
 /* policy editor */
 .policy-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.policy-header select {
+.policy-header select,
+.policy-header .agent-field {
   padding: 6px 10px;
   border: 1px solid #d4d4d4;
   border-radius: 6px;
   font-size: 13.5px;
   background: #fff;
 }
+.policy-header .agent-field { width: 340px; }
 .policy-editor h3 {
   font-size: 11px;
   font-weight: 700;

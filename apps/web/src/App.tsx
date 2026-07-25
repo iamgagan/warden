@@ -211,6 +211,11 @@ function Dashboard({ token, onUnauthorized }: { token: string; onUnauthorized: (
 function PolicyEditor({ token, onUnauthorized }: { token: string; onUnauthorized: () => void }) {
   const [agents, setAgents] = useState<AgentSummary[]>([]);
   const [agentName, setAgentName] = useState<string | null>(null); // null = global default
+  // Free-text draft for the agent field, decoupled from `agentName` so typing
+  // doesn't reload the policy on every keystroke — only on blur/Enter. Lets
+  // you pre-configure a policy for an agent that hasn't run yet, not just
+  // pick from agents that already exist (PUT creates the agent on save).
+  const [agentDraft, setAgentDraft] = useState('');
   const [versions, setVersions] = useState<PolicyVersion[]>([]);
   const [rules, setRules] = useState<PolicyRules>(DEFAULT_RULES);
   const [merchantCaps, setMerchantCaps] = useState<Array<{ merchant: string; dollars: string }>>([]);
@@ -252,7 +257,10 @@ function PolicyEditor({ token, onUnauthorized }: { token: string; onUnauthorized
   }, [loadAgents]);
   useEffect(() => {
     void loadPolicy(agentName);
+    setAgentDraft(agentName ?? '');
   }, [agentName, loadPolicy]);
+
+  const commitAgentDraft = () => setAgentName(agentDraft.trim() || null);
 
   const save = async () => {
     setStatus({ kind: 'saving' });
@@ -283,18 +291,26 @@ function PolicyEditor({ token, onUnauthorized }: { token: string; onUnauthorized
     <section className="panel policy-editor">
       <div className="policy-header">
         <h2>Policy</h2>
-        <select value={agentName ?? ''} onChange={(e) => setAgentName(e.target.value || null)}>
-          <option value="">Global default</option>
+        <input
+          className="agent-field"
+          list="policy-agents"
+          value={agentDraft}
+          placeholder="Global default (type an agent name to scope it, new or existing)"
+          onChange={(e) => setAgentDraft(e.target.value)}
+          onBlur={commitAgentDraft}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') commitAgentDraft();
+          }}
+        />
+        <datalist id="policy-agents">
           {agents.map((a) => (
-            <option key={a.id} value={a.name}>
-              {a.name}
-            </option>
+            <option key={a.id} value={a.name} />
           ))}
-        </select>
+        </datalist>
       </div>
       <p className="subtle">
         {agentName
-          ? `Rules for agent "${agentName}". Falls back to the global default if this agent has none.`
+          ? `Rules for agent "${agentName}". Falls back to the global default if this agent has none. Saving creates the agent if it doesn't exist yet.`
           : 'Global default policy — applies to any agent without its own active policy.'}
       </p>
 
@@ -463,15 +479,31 @@ function DollarField({
   onChange: (cents: number) => void;
   hint?: string;
 }) {
+  // Decoupled draft text, committed on blur only — a controlled value that
+  // reformats to .toFixed(2) on every keystroke corrupts mid-typing (e.g.
+  // typing "40" lands as "4.00" once the first "4" reformats and shifts the
+  // cursor before "0" is typed). Found live, rehearsing the demo video.
+  const [draft, setDraft] = useState((cents / 100).toFixed(2));
+  useEffect(() => setDraft((cents / 100).toFixed(2)), [cents]);
+
+  const commit = () => {
+    const parsed = Math.max(0, Math.round((parseFloat(draft) || 0) * 100));
+    onChange(parsed);
+    setDraft((parsed / 100).toFixed(2));
+  };
+
   return (
     <label>
       {label} {hint && <span className="subtle">({hint})</span>}
       <input
-        type="number"
-        min={0}
-        step="0.01"
-        value={(cents / 100).toFixed(2)}
-        onChange={(e) => onChange(Math.max(0, Math.round((Number(e.target.value) || 0) * 100)))}
+        type="text"
+        inputMode="decimal"
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') commit();
+        }}
       />
     </label>
   );

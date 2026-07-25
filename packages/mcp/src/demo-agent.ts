@@ -29,19 +29,24 @@ const say = async (line: string, pauseMs = 900): Promise<void> => {
 const dollars = (cents: number) => `$${(cents / 100).toFixed(2)}`;
 
 // ── policy setup (the human's side: normally done in the dashboard) ─────────
+// Only seeds a default when the agent has no active policy yet — a policy
+// set live in the dashboard (e.g. right before recording a demo video) must
+// be genuinely respected here, not silently overwritten on every run.
 {
   const db = openWardenDb(dbPath);
   const agent = db.repo.getOrCreateAgent('shopping-agent', 'demo shopping agent');
-  db.repo.setActivePolicy(
-    agent.id,
-    JSON.stringify(
-      PolicyRulesSchema.parse({
-        per_task_budget_cents: 8000,
-        per_card_cap_cents: 5000,
-        blocked_merchants: ['sketchy-gift-cards.example'],
-      }),
-    ),
-  );
+  if (!db.repo.getActivePolicy(agent.id)) {
+    db.repo.setActivePolicy(
+      agent.id,
+      JSON.stringify(
+        PolicyRulesSchema.parse({
+          per_task_budget_cents: 8000,
+          per_card_cap_cents: 5000,
+          blocked_merchants: ['sketchy-gift-cards.example'],
+        }),
+      ),
+    );
+  }
   db.close();
 }
 

@@ -33,10 +33,54 @@ export interface Health {
   upstream_auth: 'ok' | 'needs_login';
 }
 
+export interface AgentSummary {
+  id: string;
+  name: string;
+  description: string | null;
+  created_at: string;
+  total_spent_cents: number;
+  receipts: number;
+  blocks: number;
+}
+
+// SPEC §2.6 — mirrors PolicyRulesSchema.
+export interface PolicyRules {
+  allowed_merchants: string[];
+  blocked_merchants: string[];
+  allowed_categories: string[];
+  per_card_cap_cents: number;
+  per_task_budget_cents: number;
+  per_merchant_caps: Record<string, number>;
+  velocity: { max_cards_per_hour: number; max_amount_cents_per_day: number };
+  approval_threshold_cents: number;
+  card_ttl_minutes: number;
+  default_rail: 'agentcard' | 'stripe';
+}
+
+export interface PolicyVersion {
+  id: string;
+  version: number;
+  active: boolean;
+  rules: PolicyRules;
+  created_at: string;
+}
+
+export interface PolicyResponse {
+  agent_name: string | null;
+  active: PolicyVersion | null;
+  versions: PolicyVersion[];
+}
+
 export class UnauthorizedError extends Error {}
 
-async function request<T>(path: string, token: string): Promise<T> {
-  const res = await fetch(path, { headers: { authorization: `Bearer ${token}` } });
+async function request<T>(path: string, token: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(path, {
+    ...init,
+    headers: {
+      authorization: `Bearer ${token}`,
+      ...(init?.body ? { 'content-type': 'application/json' } : {}),
+    },
+  });
   if (res.status === 401) throw new UnauthorizedError('invalid token');
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return (await res.json()) as T;
@@ -49,6 +93,17 @@ export const api = {
   receipt: (token: string, id: string): Promise<ReceiptDetail> =>
     request(`/api/v1/receipts/${id}`, token),
   stats: (token: string): Promise<Stats> => request('/api/v1/stats', token),
+  agents: (token: string): Promise<{ agents: AgentSummary[] }> => request('/api/v1/agents', token),
+  policies: (token: string, agentName?: string | null): Promise<PolicyResponse> =>
+    request(
+      `/api/v1/policies${agentName ? `?agent=${encodeURIComponent(agentName)}` : ''}`,
+      token,
+    ),
+  putPolicy: (token: string, agentName: string | null, rules: PolicyRules): Promise<PolicyResponse> =>
+    request('/api/v1/policies', token, {
+      method: 'PUT',
+      body: JSON.stringify({ agent_name: agentName, rules }),
+    }),
 };
 
 export const dollars = (cents: number): string =>

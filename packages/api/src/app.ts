@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
-import type { Repo } from '@warden/db';
+import { PolicyRulesSchema } from '@warden/core';
+import type { PolicyRow, Repo } from '@warden/db';
 
 export interface UpstreamAuthStatus {
   upstream_auth: 'ok' | 'needs_login';
@@ -28,6 +29,13 @@ const eventsQuery = z.object({
     .enum(['block', 'circuit_break', 'approval_required', 'approved', 'denied', 'card_issued', 'card_closed'])
     .optional(),
   limit: z.coerce.number().int().min(1).max(500).default(100),
+});
+
+const policiesQuery = z.object({ agent: z.string().optional() });
+
+const putPolicyBody = z.object({
+  agent_name: z.string().min(1).nullable(),
+  rules: PolicyRulesSchema,
 });
 
 /** SPEC §3.3 — read paths (T9). Bearer auth on everything except /healthz. */
@@ -90,6 +98,34 @@ export function createApiApp(opts: ApiOptions): Hono {
       })),
     }),
   );
+
+  app.get('/api/v1/policies', (c) => {
+    const parsed = policiesQuery.safeParse(c.req.query());
+    if (!parsed.success) return c.json(apiError('BAD_REQUEST', parsed.error.message), 400);
+    let agentId: string | null = null;
+    if (parsed.data.agent) {
+      const row = repo.getAgentByName(parsed.data.agent);
+      if (!row) return c.json(apiError('NOT_FOUND', `unknown agent "${parsed.data.agent}"`), 404);
+      agentId = row.id;
+    }
+    const active = repo.getActivePolicy(agentId);
+    const versions = repo.listPolicyVersions(agentId);
+    return c.json({
+      agent_name: parsed.data.agent ?? null,
+      active: active ? policyJson(active) : null,
+      versions: versions.map(policyJson),
+    });
+  });
+
+  app.put('/api/v1/policies', async (c) => {
+    const body = await c.req.json().catch(() => null);
+    const parsed = putPolicyBody.safeParse(body);
+    if (!parsed.success) return c.json(apiError('BAD_REQUEST', parsed.error.message), 400);
+    const { agent_name, rules } = parsed.data;
+    const agentId = agent_name === null ? null : repo.getOrCreateAgent(agent_name).id;
+    const row = repo.setActivePolicy(agentId, JSON.stringify(rules));
+    return c.json({ agent_name, active: policyJson(row) });
+  });
 
   app.get('/api/v1/events', (c) => {
     const parsed = eventsQuery.safeParse(c.req.query());
@@ -156,6 +192,16 @@ function receiptJson(r: {
     occurred_at: r.occurredAt,
     created_at: r.createdAt,
     decision_summary: summarizeDecision(decision),
+  };
+}
+
+function policyJson(row: PolicyRow) {
+  return {
+    id: row.id,
+    version: row.version,
+    active: row.active === 1,
+    rules: JSON.parse(row.rulesJson),
+    created_at: row.createdAt,
   };
 }
 

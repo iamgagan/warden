@@ -159,6 +159,44 @@ describe('warden_issue_card', () => {
   });
 });
 
+describe('warden_precheck_purchase', () => {
+  it('returns allow for an in-policy purchase and never mints a card or touches state', async () => {
+    const { task_id } = service.startTask({ agent_name: 'shopper', intent: 'buy paper' });
+    const result = service.precheckPurchase({ task_id, merchant: 'staples', amount_cents: 1000 });
+    expect(result).toEqual({ decision: 'allow', reasons: [] });
+    expect(await upstream.listCards()).toHaveLength(0);
+    expect(db.repo.getTask(task_id)?.spentCents).toBe(0);
+    expect(db.repo.countPolicyEvents('block')).toBe(0);
+  });
+
+  it('returns block with reasons for a blocked merchant and records an advisory policy_event', async () => {
+    setPolicy('shopper', { blocked_merchants: ['sketchy-gift-cards'] });
+    const { task_id } = service.startTask({ agent_name: 'shopper', intent: 'x' });
+    const result = service.precheckPurchase({
+      task_id,
+      merchant: 'Sketchy-Gift-Cards',
+      amount_cents: 500,
+    });
+    expect(result.decision).toBe('block');
+    expect(result.reasons.length).toBeGreaterThan(0);
+    expect(db.repo.countPolicyEvents('block')).toBe(1);
+    expect(await upstream.listCards()).toHaveLength(0); // advisory only, never mints
+  });
+
+  it('returns needs_approval over the threshold without blocking the eventual issuance path', async () => {
+    setPolicy('shopper', { approval_threshold_cents: 1000 });
+    const { task_id } = service.startTask({ agent_name: 'shopper', intent: 'x' });
+    const result = service.precheckPurchase({ task_id, merchant: 'staples', amount_cents: 2000 });
+    expect(result.decision).toBe('needs_approval');
+  });
+
+  it('rejects prechecks on unknown or non-active tasks', () => {
+    expect(() =>
+      service.precheckPurchase({ task_id: 'nope', merchant: 'staples', amount_cents: 100 }),
+    ).toThrow();
+  });
+});
+
 describe('warden_get_card_details', () => {
   it('passes through credentials for open cards on active tasks only', async () => {
     const { task_id } = service.startTask({ agent_name: 'shopper', intent: 'x' });

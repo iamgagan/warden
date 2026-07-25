@@ -1,6 +1,7 @@
 import {
   DEFAULT_POLICY,
   evaluateIssue,
+  evaluatePurchase,
   parsePolicyRules,
   type PolicyRules,
 } from '@warden/core';
@@ -204,6 +205,42 @@ export class WardenService {
       expires: '7d-unused',
       rail,
     };
+  }
+
+  /**
+   * SPEC §3.1 — advisory-only deterministic evaluation. Never mints a card or
+   * touches task/card state; only writes a policy_event when it would block,
+   * so the dashboard's block feed stays complete even for prechecks the agent
+   * never acted on.
+   */
+  precheckPurchase(input: {
+    task_id: string;
+    merchant: string;
+    amount_cents: number;
+    category?: string;
+  }): { decision: 'allow' | 'block' | 'needs_approval'; reasons: string[] } {
+    const task = this.activeTaskOrThrow(input.task_id);
+    const { rules } = this.loadPolicy(task);
+    const result = evaluatePurchase(rules, {
+      merchant: input.merchant,
+      amount_cents: input.amount_cents,
+      category: input.category,
+      taskSpentCents: task.spentCents,
+      taskBudgetCents: task.budgetCents,
+    });
+    if (result.decision === 'block') {
+      this.repo.insertPolicyEvent({
+        type: 'block',
+        taskId: task.id,
+        agentId: task.agentId,
+        detailsJson: JSON.stringify({
+          reasons: result.reasons,
+          request: input,
+          enforced_at: 'advisory',
+        }),
+      });
+    }
+    return result;
   }
 
   async getCardDetails(input: { card_id: string }): Promise<CardCredentials> {

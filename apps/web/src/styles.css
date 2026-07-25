@@ -181,3 +181,100 @@ tbody tr:hover { background: #fafaf9; }
   font-size: 12px;
   overflow-x: auto;
 }
+
+/* tabs */
+.tabs { display: flex; gap: 4px; margin-bottom: 12px; }
+.tabs button {
+  border: none;
+  background: none;
+  padding: 8px 14px;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: #888;
+  cursor: pointer;
+  border-radius: 8px 8px 0 0;
+}
+.tabs button.active { color: #1a1a1a; background: #fff; border: 1px solid #e5e5e5; border-bottom: none; }
+
+/* policy editor */
+.policy-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.policy-header select {
+  padding: 6px 10px;
+  border: 1px solid #d4d4d4;
+  border-radius: 6px;
+  font-size: 13.5px;
+  background: #fff;
+}
+.policy-editor h3 {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: #999;
+  margin: 20px 0 10px;
+}
+.policy-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+  margin-top: 14px;
+}
+.policy-grid label,
+.policy-editor > label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #444;
+}
+.policy-grid input,
+.policy-grid select {
+  font-weight: 400;
+  font-size: 13.5px;
+  padding: 8px 10px;
+  border: 1px solid #d4d4d4;
+  border-radius: 6px;
+  color: #1a1a1a;
+}
+.merchant-caps { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.merchant-cap-row { display: flex; gap: 8px; }
+.merchant-cap-row input {
+  padding: 8px 10px;
+  border: 1px solid #d4d4d4;
+  border-radius: 6px;
+  font-size: 13.5px;
+}
+.merchant-cap-row input:first-child { width: 220px; }
+.merchant-cap-row input:last-child { width: 100px; }
+.merchant-cap-row button {
+  border: 1px solid #d4d4d4;
+  background: #fff;
+  border-radius: 6px;
+  width: 32px;
+  cursor: pointer;
+  color: #888;
+}
+.merchant-caps > button {
+  border: 1px dashed #d4d4d4;
+  background: none;
+  border-radius: 6px;
+  padding: 7px 12px;
+  font-size: 13px;
+  color: #555;
+  cursor: pointer;
+}
+.policy-actions { display: flex; align-items: center; gap: 12px; margin-top: 20px; }
+.policy-actions .save {
+  border: none;
+  background: #1a1a1a;
+  color: #fff;
+  padding: 9px 18px;
+  border-radius: 6px;
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.policy-actions .save:disabled { opacity: 0.6; cursor: default; }
+.saved-msg { color: #15803d; font-size: 13px; }
+.version-table { margin-top: 4px; }

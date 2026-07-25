@@ -1,6 +1,6 @@
 # Warden — Build Status
 
-Updated: 2026-07-24 · multi-rail pivot ahead of investor demo · 99 tests green
+Updated: 2026-07-25 · T11/T12 done + multi-rail pivot ahead of investor demo · 109 tests green
 
 ## Done — Week 1: Receipts MVP (T1–T10)
 
@@ -39,6 +39,25 @@ README quickstart.
    the structured payload.
 4. Business statuses (`kyc_required`, `wallet_funding_required`, …) arrive as
    successful results with a `status` field → surfaced as clean errors.
+
+## Done — Week 2: Policy CRUD + Dashboard Editor (T11–T12, 2026-07-25)
+
+- **T11** `GET/PUT /api/v1/policies` (versioned, agent-scoped or global default — the repo
+  layer's `setActivePolicy`/`getActivePolicy`/`listPolicyVersions` already enforced "exactly
+  one active version, never mutates old" from T2, this just wired REST on top) · zod-validated
+  via the same `PolicyRulesSchema` used everywhere else · `warden_precheck_purchase` MCP tool
+  (advisory-only `evaluatePurchase`, never mints a card, writes a policy_event only on block).
+  15 API tests, 4 new precheck tests.
+- **T12** Dashboard policy editor: per-agent selector (falls back to global default), form
+  fields for every `PolicyRules` key incl. per-merchant caps (add/remove rows) and the new
+  `default_rail` selector — no raw JSON textarea — plus a version-history table. Live-verified
+  end to end in the browser: edited shopping-agent's real policy (budget $80→$40, added
+  `allowed_merchants: ["Staples"]` and a `Staples: $25` merchant cap), saved, confirmed via the
+  API that it landed as version 2 with version 1 correctly marked superseded and untouched
+  fields (`blocked_merchants`) round-tripped intact.
+
+Demo target hit: "my agent can only spend $X at approved merchants" is real — editable in the
+dashboard, enforced by the same deterministic engine that's been live since Week 1.
 
 ## Multi-rail pivot (2026-07-24, ahead of Monday investor demo)
 
@@ -90,7 +109,7 @@ authorization lands) rather than a native upstream guarantee for this rail.
 
 | Week | Tasks | Demo |
 |---|---|---|
-| 2 · Jul 20–26 | T11 policy CRUD REST + `warden_precheck_purchase` (engine already wired to issuance) · T12 dashboard policy editor | "My agent can only spend $X at approved merchants" |
+| ~~2 · Jul 20–26~~ | ~~T11 policy CRUD REST + `warden_precheck_purchase`~~ · ~~T12 dashboard policy editor~~ — **done 2026-07-25** | "My agent can only spend $X at approved merchants" ✅ |
 | 3 · Jul 27–Aug 2 | T13 circuit breaker wired into reconciler (auto close-all + halt + resume UI) · T14 card TTL sweep (blast-radius stat already done) | "40 charges in a minute → frozen" |
 | 4 · Aug 3–9 | T15 approval service (replaces stub) · T16 approvals UI + webhook · live injection demo on real sandbox (needs KYC) | The viral moment |
 | 5 · Aug 10–13 | T18 multi-agent dashboard page (API rollup exists) · T17 category budgets [STRETCH] | "Which of my agents spent what" |

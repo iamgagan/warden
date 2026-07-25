@@ -3,11 +3,27 @@ import {
   api,
   dollars,
   UnauthorizedError,
+  type AgentSummary,
   type Health,
+  type PolicyRules,
+  type PolicyVersion,
   type Receipt,
   type ReceiptDetail,
   type Stats,
 } from './api.js';
+
+const DEFAULT_RULES: PolicyRules = {
+  allowed_merchants: [],
+  blocked_merchants: [],
+  allowed_categories: [],
+  per_card_cap_cents: 5000,
+  per_task_budget_cents: 10_000,
+  per_merchant_caps: {},
+  velocity: { max_cards_per_hour: 0, max_amount_cents_per_day: 0 },
+  approval_threshold_cents: 0,
+  card_ttl_minutes: 60,
+  default_rail: 'agentcard',
+};
 
 const TOKEN_KEY = 'warden_api_token';
 const POLL_MS = 5000;
@@ -73,6 +89,7 @@ function TokenGate({ onSubmit }: { onSubmit: (token: string) => void }) {
 }
 
 function Dashboard({ token, onUnauthorized }: { token: string; onUnauthorized: () => void }) {
+  const [view, setView] = useState<'receipts' | 'policy'>('receipts');
   const [health, setHealth] = useState<Health | null>(null);
   const [stats, setStats] = useState<Stats | null>(null);
   const [receipts, setReceipts] = useState<Receipt[]>([]);
@@ -134,47 +151,329 @@ function Dashboard({ token, onUnauthorized }: { token: string; onUnauthorized: (
 
       {error && <p className="error">API error: {error}</p>}
 
-      <section className="panel">
-        <h2>Receipts</h2>
-        {receipts.length === 0 ? (
-          <p className="empty">
-            No receipts yet. Point your agent at warden-mcp, start a task, and every charge will
-            land here bound to its intent.
-          </p>
-        ) : (
-          <table>
+      <nav className="tabs">
+        <button className={view === 'receipts' ? 'active' : ''} onClick={() => setView('receipts')}>
+          Receipts
+        </button>
+        <button className={view === 'policy' ? 'active' : ''} onClick={() => setView('policy')}>
+          Policy
+        </button>
+      </nav>
+
+      {view === 'receipts' ? (
+        <section className="panel">
+          <h2>Receipts</h2>
+          {receipts.length === 0 ? (
+            <p className="empty">
+              No receipts yet. Point your agent at warden-mcp, start a task, and every charge will
+              land here bound to its intent.
+            </p>
+          ) : (
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Agent</th>
+                  <th>Merchant</th>
+                  <th className="num">Amount</th>
+                  <th>Intent</th>
+                  <th>Card</th>
+                  <th>Rail</th>
+                </tr>
+              </thead>
+              <tbody>
+                {receipts.map((r) => (
+                  <tr key={r.id} onClick={() => void openReceipt(r.id)}>
+                    <td className="mono">{new Date(r.occurred_at).toLocaleString()}</td>
+                    <td>{r.agent}</td>
+                    <td>{r.merchant}</td>
+                    <td className="num">{dollars(r.amount_cents)}</td>
+                    <td className="intent">{r.intent}</td>
+                    <td className="mono">{r.card_id}</td>
+                    <td>
+                      <RailBadge rail={r.rail} />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </section>
+      ) : (
+        <PolicyEditor token={token} onUnauthorized={onUnauthorized} />
+      )}
+
+      {selected && <Drawer receipt={selected} onClose={() => setSelected(null)} />}
+    </div>
+  );
+}
+
+function PolicyEditor({ token, onUnauthorized }: { token: string; onUnauthorized: () => void }) {
+  const [agents, setAgents] = useState<AgentSummary[]>([]);
+  const [agentName, setAgentName] = useState<string | null>(null); // null = global default
+  const [versions, setVersions] = useState<PolicyVersion[]>([]);
+  const [rules, setRules] = useState<PolicyRules>(DEFAULT_RULES);
+  const [merchantCaps, setMerchantCaps] = useState<Array<{ merchant: string; dollars: string }>>([]);
+  const [status, setStatus] = useState<{ kind: 'idle' | 'saving' | 'saved' | 'error'; message?: string }>(
+    { kind: 'idle' },
+  );
+
+  const loadAgents = useCallback(async () => {
+    try {
+      setAgents((await api.agents(token)).agents);
+    } catch (err) {
+      if (err instanceof UnauthorizedError) onUnauthorized();
+    }
+  }, [token, onUnauthorized]);
+
+  const loadPolicy = useCallback(
+    async (name: string | null) => {
+      try {
+        const res = await api.policies(token, name);
+        setVersions(res.versions);
+        const active = res.active?.rules ?? DEFAULT_RULES;
+        setRules(active);
+        setMerchantCaps(
+          Object.entries(active.per_merchant_caps).map(([merchant, cents]) => ({
+            merchant,
+            dollars: (cents / 100).toFixed(2),
+          })),
+        );
+        setStatus({ kind: 'idle' });
+      } catch (err) {
+        if (err instanceof UnauthorizedError) onUnauthorized();
+      }
+    },
+    [token, onUnauthorized],
+  );
+
+  useEffect(() => {
+    void loadAgents();
+  }, [loadAgents]);
+  useEffect(() => {
+    void loadPolicy(agentName);
+  }, [agentName, loadPolicy]);
+
+  const save = async () => {
+    setStatus({ kind: 'saving' });
+    try {
+      const per_merchant_caps: Record<string, number> = {};
+      for (const row of merchantCaps) {
+        const merchant = row.merchant.trim();
+        const cents = Math.round(parseFloat(row.dollars || '0') * 100);
+        if (merchant && cents > 0) per_merchant_caps[merchant] = cents;
+      }
+      const res = await api.putPolicy(token, agentName, { ...rules, per_merchant_caps });
+      await loadPolicy(agentName);
+      setStatus({ kind: 'saved', message: `saved as version ${res.active?.version}` });
+    } catch (err) {
+      if (err instanceof UnauthorizedError) onUnauthorized();
+      else setStatus({ kind: 'error', message: err instanceof Error ? err.message : String(err) });
+    }
+  };
+
+  const csv = (list: string[]) => list.join(', ');
+  const parseCsv = (value: string) =>
+    value
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+  return (
+    <section className="panel policy-editor">
+      <div className="policy-header">
+        <h2>Policy</h2>
+        <select value={agentName ?? ''} onChange={(e) => setAgentName(e.target.value || null)}>
+          <option value="">Global default</option>
+          {agents.map((a) => (
+            <option key={a.id} value={a.name}>
+              {a.name}
+            </option>
+          ))}
+        </select>
+      </div>
+      <p className="subtle">
+        {agentName
+          ? `Rules for agent "${agentName}". Falls back to the global default if this agent has none.`
+          : 'Global default policy — applies to any agent without its own active policy.'}
+      </p>
+
+      <div className="policy-grid">
+        <label>
+          Allowed merchants <span className="subtle">(empty = allow any)</span>
+          <input
+            value={csv(rules.allowed_merchants)}
+            onChange={(e) => setRules({ ...rules, allowed_merchants: parseCsv(e.target.value) })}
+            placeholder="Staples, AWS"
+          />
+        </label>
+        <label>
+          Blocked merchants
+          <input
+            value={csv(rules.blocked_merchants)}
+            onChange={(e) => setRules({ ...rules, blocked_merchants: parseCsv(e.target.value) })}
+            placeholder="sketchy-gift-cards.example"
+          />
+        </label>
+        <label>
+          Allowed categories <span className="subtle">(empty = allow any)</span>
+          <input
+            value={csv(rules.allowed_categories)}
+            onChange={(e) => setRules({ ...rules, allowed_categories: parseCsv(e.target.value) })}
+            placeholder="office_supplies, cloud_hosting"
+          />
+        </label>
+        <label>
+          Default rail
+          <select
+            value={rules.default_rail}
+            onChange={(e) => setRules({ ...rules, default_rail: e.target.value as 'agentcard' | 'stripe' })}
+          >
+            <option value="agentcard">AgentCard</option>
+            <option value="stripe">Stripe</option>
+          </select>
+        </label>
+        <DollarField
+          label="Per-card cap"
+          hint="clamped to $1–$50 by the upstream network"
+          cents={rules.per_card_cap_cents}
+          onChange={(c) => setRules({ ...rules, per_card_cap_cents: c })}
+        />
+        <DollarField
+          label="Per-task budget"
+          cents={rules.per_task_budget_cents}
+          onChange={(c) => setRules({ ...rules, per_task_budget_cents: c })}
+        />
+        <DollarField
+          label="Approval threshold"
+          hint="0 = never require approval"
+          cents={rules.approval_threshold_cents}
+          onChange={(c) => setRules({ ...rules, approval_threshold_cents: c })}
+        />
+        <label>
+          Card TTL (minutes)
+          <input
+            type="number"
+            min={1}
+            value={rules.card_ttl_minutes}
+            onChange={(e) =>
+              setRules({ ...rules, card_ttl_minutes: Math.max(1, Number(e.target.value) || 1) })
+            }
+          />
+        </label>
+        <label>
+          Max cards / hour <span className="subtle">(0 = unlimited)</span>
+          <input
+            type="number"
+            min={0}
+            value={rules.velocity.max_cards_per_hour}
+            onChange={(e) =>
+              setRules({
+                ...rules,
+                velocity: { ...rules.velocity, max_cards_per_hour: Math.max(0, Number(e.target.value) || 0) },
+              })
+            }
+          />
+        </label>
+        <DollarField
+          label="Max spend / day"
+          hint="0 = unlimited"
+          cents={rules.velocity.max_amount_cents_per_day}
+          onChange={(c) => setRules({ ...rules, velocity: { ...rules.velocity, max_amount_cents_per_day: c } })}
+        />
+      </div>
+
+      <h3>Per-merchant caps</h3>
+      <div className="merchant-caps">
+        {merchantCaps.map((row, i) => (
+          <div className="merchant-cap-row" key={i}>
+            <input
+              placeholder="Merchant"
+              value={row.merchant}
+              onChange={(e) =>
+                setMerchantCaps(merchantCaps.map((r, idx) => (idx === i ? { ...r, merchant: e.target.value } : r)))
+              }
+            />
+            <input
+              placeholder="0.00"
+              value={row.dollars}
+              onChange={(e) =>
+                setMerchantCaps(merchantCaps.map((r, idx) => (idx === i ? { ...r, dollars: e.target.value } : r)))
+              }
+            />
+            <button type="button" onClick={() => setMerchantCaps(merchantCaps.filter((_, idx) => idx !== i))}>
+              ×
+            </button>
+          </div>
+        ))}
+        <button type="button" onClick={() => setMerchantCaps([...merchantCaps, { merchant: '', dollars: '' }])}>
+          + add merchant cap
+        </button>
+      </div>
+
+      <div className="policy-actions">
+        <button className="save" onClick={() => void save()} disabled={status.kind === 'saving'}>
+          {status.kind === 'saving' ? 'Saving…' : 'Save policy'}
+        </button>
+        {status.kind === 'saved' && <span className="saved-msg">✓ {status.message}</span>}
+        {status.kind === 'error' && <span className="error">Failed: {status.message}</span>}
+      </div>
+
+      {versions.length > 0 && (
+        <>
+          <h3>Version history</h3>
+          <table className="version-table">
             <thead>
               <tr>
-                <th>Time</th>
-                <th>Agent</th>
-                <th>Merchant</th>
-                <th className="num">Amount</th>
-                <th>Intent</th>
-                <th>Card</th>
-                <th>Rail</th>
+                <th>Version</th>
+                <th>Status</th>
+                <th>Created</th>
               </tr>
             </thead>
             <tbody>
-              {receipts.map((r) => (
-                <tr key={r.id} onClick={() => void openReceipt(r.id)}>
-                  <td className="mono">{new Date(r.occurred_at).toLocaleString()}</td>
-                  <td>{r.agent}</td>
-                  <td>{r.merchant}</td>
-                  <td className="num">{dollars(r.amount_cents)}</td>
-                  <td className="intent">{r.intent}</td>
-                  <td className="mono">{r.card_id}</td>
+              {versions.map((v) => (
+                <tr key={v.id}>
+                  <td>{v.version}</td>
                   <td>
-                    <RailBadge rail={r.rail} />
+                    {v.active ? (
+                      <span className="rail-badge rail-agentcard">active</span>
+                    ) : (
+                      <span className="subtle">superseded</span>
+                    )}
                   </td>
+                  <td className="mono">{new Date(v.created_at).toLocaleString()}</td>
                 </tr>
               ))}
             </tbody>
           </table>
-        )}
-      </section>
+        </>
+      )}
+    </section>
+  );
+}
 
-      {selected && <Drawer receipt={selected} onClose={() => setSelected(null)} />}
-    </div>
+function DollarField({
+  label,
+  cents,
+  onChange,
+  hint,
+}: {
+  label: string;
+  cents: number;
+  onChange: (cents: number) => void;
+  hint?: string;
+}) {
+  return (
+    <label>
+      {label} {hint && <span className="subtle">({hint})</span>}
+      <input
+        type="number"
+        min={0}
+        step="0.01"
+        value={(cents / 100).toFixed(2)}
+        onChange={(e) => onChange(Math.max(0, Math.round((Number(e.target.value) || 0) * 100)))}
+      />
+    </label>
   );
 }
 

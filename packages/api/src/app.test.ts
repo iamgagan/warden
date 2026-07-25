@@ -150,3 +150,81 @@ describe('agents, events, stats', () => {
     });
   });
 });
+
+describe('policies (T11)', () => {
+  it('GET returns null/empty before any policy is set', async () => {
+    const body = await (await app.request('/api/v1/policies', auth)).json();
+    expect(body).toEqual({ agent_name: null, active: null, versions: [] });
+  });
+
+  it('PUT creates version 1 as the global default when agent_name is null', async () => {
+    const res = await app.request('/api/v1/policies', {
+      ...auth,
+      method: 'PUT',
+      headers: { ...auth.headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ agent_name: null, rules: { per_task_budget_cents: 5000 } }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.agent_name).toBeNull();
+    expect(body.active).toMatchObject({ version: 1, active: true });
+    expect(body.active.rules.per_task_budget_cents).toBe(5000);
+
+    const get = await (await app.request('/api/v1/policies', auth)).json();
+    expect(get.active).toMatchObject({ version: 1 });
+    expect(get.versions).toHaveLength(1);
+  });
+
+  it('PUT for a new agent name creates the agent and scopes the policy to it', async () => {
+    await app.request('/api/v1/policies', {
+      ...auth,
+      method: 'PUT',
+      headers: { ...auth.headers, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        agent_name: 'shopping-agent',
+        rules: { allowed_merchants: ['Staples'], per_task_budget_cents: 4000 },
+      }),
+    });
+    expect(db.repo.getAgentByName('shopping-agent')).toBeDefined();
+
+    const scoped = await (await app.request('/api/v1/policies?agent=shopping-agent', auth)).json();
+    expect(scoped.active.rules.allowed_merchants).toEqual(['Staples']);
+
+    // The global default (agent_name: null) is untouched by an agent-scoped PUT.
+    const global = await (await app.request('/api/v1/policies', auth)).json();
+    expect(global.active).toBeNull();
+  });
+
+  it('a second PUT for the same agent creates version 2 and deactivates version 1', async () => {
+    const put = (rules: object) =>
+      app.request('/api/v1/policies', {
+        ...auth,
+        method: 'PUT',
+        headers: { ...auth.headers, 'content-type': 'application/json' },
+        body: JSON.stringify({ agent_name: 'shopper', rules }),
+      });
+    await put({ per_task_budget_cents: 1000 });
+    await put({ per_task_budget_cents: 2000 });
+
+    const body = await (await app.request('/api/v1/policies?agent=shopper', auth)).json();
+    expect(body.active).toMatchObject({ version: 2, active: true });
+    expect(body.versions).toHaveLength(2);
+    expect(body.versions.find((v: { version: number }) => v.version === 1)).toMatchObject({
+      active: false,
+    });
+  });
+
+  it('GET 404s for an unknown agent name', async () => {
+    expect((await app.request('/api/v1/policies?agent=nobody', auth)).status).toBe(404);
+  });
+
+  it('PUT 400s on invalid rules', async () => {
+    const res = await app.request('/api/v1/policies', {
+      ...auth,
+      method: 'PUT',
+      headers: { ...auth.headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ agent_name: null, rules: { per_task_budget_cents: -5 } }),
+    });
+    expect(res.status).toBe(400);
+  });
+});

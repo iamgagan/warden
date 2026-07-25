@@ -63,6 +63,21 @@ export function createWardenMcpServer(service: WardenService): McpServer {
   );
 
   server.registerTool(
+    'warden_precheck_purchase',
+    {
+      description:
+        'Advisory-only check: would this purchase be allowed under the active policy right now? Never mints a card or changes state; useful for an agent to sanity-check before spending effort on a purchase flow.',
+      inputSchema: {
+        task_id: z.string().min(1),
+        merchant: z.string().min(1),
+        amount_cents: z.number().int().positive(),
+        category: z.string().optional(),
+      },
+    },
+    async (args) => run(() => service.precheckPurchase(args)),
+  );
+
+  server.registerTool(
     'warden_get_card_details',
     {
       description:

@@ -98,11 +98,28 @@ export class Reconciler {
       const upstream = this.upstreams[card.rail];
       if (!upstream) continue;
       try {
+        // Stop new authorizations, then ingest the rail's current state before
+        // deciding whether this reservation is safe to release. A pending
+        // capture must stay pollable until it becomes terminal.
         await upstream.closeCard(card.id);
-        const authorization = this.repo.getAuthorizationByCard(card.id);
-        if (authorization) this.repo.releaseAuthorization(authorization.id);
-        else this.repo.addTaskSpent(task.id, -card.amountCents);
-        this.repo.setCardState(card.id, 'expired');
+        const transactions = await upstream.listTransactions(card.id);
+        for (const transaction of transactions) this.ingestTransaction(card, transaction);
+        const hasPendingCapture = transactions.some(
+          (transaction) => transaction.status === 'PENDING',
+        );
+        const hasConsumedCard = transactions.some(
+          (transaction) => transaction.status !== 'DECLINED',
+        );
+        if (hasPendingCapture) {
+          this.repo.setCardState(card.id, 'used');
+        } else if (hasConsumedCard) {
+          this.repo.setCardState(card.id, 'closed');
+        } else {
+          const authorization = this.repo.getAuthorizationByCard(card.id);
+          if (authorization) this.repo.releaseAuthorization(authorization.id);
+          else this.repo.addTaskSpent(task.id, -card.amountCents);
+          this.repo.setCardState(card.id, 'expired');
+        }
         this.repo.insertPolicyEvent({
           type: 'card_closed',
           taskId: task.id,
@@ -111,6 +128,7 @@ export class Reconciler {
             card_id: card.id,
             reason: 'credential_ttl_expired',
             ttl_minutes: rules.card_ttl_minutes,
+            settlement_pending: hasPendingCapture,
           }),
         });
       } catch (error) {

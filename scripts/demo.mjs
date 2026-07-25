@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process';
-import { resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 
-const dbPath = resolve(process.argv[2] ?? '/private/tmp/warden-vc-demo.db');
+const dbPath = resolve(process.argv[2] ?? join(tmpdir(), 'warden-vc-demo.db'));
 const seed = spawnSync(process.execPath, ['scripts/seed-demo.mjs', dbPath], {
   cwd: process.cwd(),
   encoding: 'utf8',

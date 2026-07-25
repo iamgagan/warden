@@ -767,14 +767,30 @@ describe('warden_get_card_details', () => {
 });
 
 describe('read-only card pass-throughs', () => {
-  it('lists configured-rail cards and reads balance from the card rail', async () => {
-    const { task_id } = service.startTask({ agent_name: 'shopper', intent: 'x' });
-    const card = await service.issueCard({ task_id, amount_cents: 1000 });
+  it('lists only the bound agent cards and reads balance from the card rail', async () => {
+    const shopperService = new WardenService({
+      repo: db.repo,
+      upstreams: { agentcard: upstream },
+      mode: 'test',
+      actorAgentName: 'shopper',
+      allowLegacyTasks: true,
+    });
+    const otherService = new WardenService({
+      repo: db.repo,
+      upstreams: { agentcard: upstream },
+      mode: 'test',
+      actorAgentName: 'other-agent',
+      allowLegacyTasks: true,
+    });
+    const { task_id } = shopperService.startTask({ agent_name: 'shopper', intent: 'x' });
+    const card = await shopperService.issueCard({ task_id, amount_cents: 1000 });
+    const otherTask = otherService.startTask({ agent_name: 'other-agent', intent: 'y' });
+    await otherService.issueCard({ task_id: otherTask.task_id, amount_cents: 500 });
 
-    expect(await service.listCards()).toEqual([
+    expect(await shopperService.listCards()).toEqual([
       expect.objectContaining({ card_id: card.card_id, rail: 'agentcard' }),
     ]);
-    expect(await service.checkBalance({ card_id: card.card_id })).toEqual({
+    expect(await shopperService.checkBalance({ card_id: card.card_id })).toEqual({
       balance_cents: 1000,
     });
   });

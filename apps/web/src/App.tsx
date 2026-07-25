@@ -1438,9 +1438,21 @@ function PolicyEditor({
     setStatus('saving');
     try {
       const response = await api.putPolicy(token, agentName, rules);
+      const confirmation = `Version ${response.active?.version ?? 1} is active`;
       setStatus('saved');
-      setMessage(`Version ${response.active?.version ?? 1} is active`);
-      await loadPolicy(agentName);
+      setMessage(confirmation);
+      try {
+        const refreshed = await api.policies(token, agentName);
+        setVersions(refreshed.versions);
+        setRules(refreshed.active?.rules ?? DEFAULT_RULES);
+      } catch (refreshError) {
+        if (refreshError instanceof UnauthorizedError) onUnauthorized();
+        else {
+          setMessage(
+            `${confirmation}. The latest policy could not be refreshed; retry before editing again.`,
+          );
+        }
+      }
     } catch (error) {
       if (error instanceof UnauthorizedError) onUnauthorized();
       else {

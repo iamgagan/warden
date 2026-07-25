@@ -576,6 +576,87 @@ describe('Reconciler (T8 done-check)', () => {
     );
   });
 
+  it('keeps a TTL-closed card pollable until a pending capture settles', async () => {
+    let phase: UpstreamTxn['status'] = 'PENDING';
+    const lifecycleRail: UpstreamClient = {
+      createCard: (request) => upstream.createCard(request),
+      closeCard: (id) => upstream.closeCard(id),
+      getCardDetails: (id) => upstream.getCardDetails(id),
+      listCards: () => upstream.listCards(),
+      checkBalance: (id) => upstream.checkBalance(id),
+      listTransactions: async (cardId) => [
+        {
+          id: 'ttl-pending-capture',
+          card_id: cardId,
+          merchant: 'Staples',
+          amount_cents: 900,
+          currency: 'USD',
+          category: 'office_supplies',
+          status: phase,
+          occurred_at: '2026-07-25T14:30:00.000Z',
+          raw: {},
+        },
+      ],
+    };
+    const ttlReconciler = new Reconciler({
+      repo: db.repo,
+      upstreams: { agentcard: lifecycleRail },
+      log: () => undefined,
+    });
+    const ttlService = new WardenService({
+      repo: db.repo,
+      upstreams: { agentcard: lifecycleRail },
+      mode: 'test',
+      actorAgentName: 'procurement-agent',
+    });
+    const agent = db.repo.getOrCreateAgent('procurement-agent');
+    db.repo.setActivePolicy(
+      agent.id,
+      JSON.stringify(PolicyRulesSchema.parse({ card_ttl_minutes: 1 })),
+    );
+    const mandate = db.repo.activateMandate(
+      db.repo.createMandate({
+        agentId: agent.id,
+        purpose: 'Buy paper',
+        merchant: 'Staples',
+        amountLimitCents: 2000,
+        perTransactionLimitCents: 1000,
+        maxTransactions: 2,
+        expiresAt: futureExpiry(),
+        rail: 'agentcard',
+        createdBy: 'operator',
+      }).id,
+      'operator',
+    );
+    const card = await ttlService.issueCard({
+      task_id: mandate.taskId!,
+      amount_cents: 1000,
+      merchant: 'Staples',
+      idempotency_key: 'ttl-capture',
+    });
+    db.sqlite
+      .prepare("UPDATE cards SET created_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
+      .run(card.card_id);
+
+    await ttlReconciler.runOnce();
+    expect(db.repo.getCard(card.card_id)?.state).toBe('used');
+    expect(db.repo.getMandate(mandate.id)).toMatchObject({
+      reservedCents: 1000,
+      settledCents: 0,
+    });
+
+    phase = 'SETTLED';
+    await ttlReconciler.runOnce();
+    expect(db.repo.getMandate(mandate.id)).toMatchObject({
+      reservedCents: 0,
+      settledCents: 900,
+      transactionCount: 1,
+    });
+    expect(
+      db.repo.listEvidence({ mandateId: mandate.id, limit: 10 }).map((row) => row.outcome),
+    ).toEqual(['settled', 'pending']);
+  });
+
   it('survives per-card upstream errors and continues the pass', async () => {
     const t1 = service.startTask({ agent_name: 'shopper', intent: 'a' });
     const c1 = await service.issueCard({ task_id: t1.task_id, amount_cents: 1000 });

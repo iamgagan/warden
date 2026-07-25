@@ -613,10 +613,27 @@ export class WardenService {
   }
 
   async listCards(): Promise<Array<CardSummary & { rail: Rail }>> {
+    if (!this.actorAgentName) {
+      throw new WardenToolError(
+        'POLICY_BLOCKED',
+        'card discovery requires an MCP identity binding (set WARDEN_AGENT_NAME)',
+        { reason: 'agent_identity_required' },
+      );
+    }
+    const agent = this.repo.getAgentByName(this.actorAgentName);
+    const visibleCardIds = new Set(
+      agent
+        ? this.repo
+            .listTasksByAgent(agent.id)
+            .flatMap((task) => this.repo.listCardsByTask(task.id).map((card) => card.id))
+        : [],
+    );
     const results = await Promise.all(
       (Object.entries(this.upstreams) as Array<[Rail, UpstreamClient]>).map(
         async ([rail, upstream]) =>
-          (await upstream.listCards()).map((card) => ({ ...card, rail })),
+          (await upstream.listCards())
+            .filter((card) => visibleCardIds.has(card.card_id))
+            .map((card) => ({ ...card, rail })),
       ),
     );
     return results.flat();
